@@ -1,0 +1,14 @@
+import re  # Import the regular expressions module
+
+# Assuming your sorted list is named sorted_objects
+objects_list = [...]
+
+# Define a function to extract the numerical part from the name
+def extract_number(obj):
+    match = re.search(r'\d+$', obj.name())  # This regex finds one or more digits (\d+) at the end of the string ($)
+    return int(match.group()) if match else 0  # Convert the found digits to an integer, or return 0 if none found
+
+# Sort the objects using the extracted number for comparison
+sorted_objects = sorted(objects_list, key=extract_number)
+
+print("Numerically sorted objects:", sorted_objects)

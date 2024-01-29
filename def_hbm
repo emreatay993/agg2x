@@ -1,0 +1,25 @@
+!   Commands inserted into this file will be executed just prior to the ANSYS SOLVE command.
+!   These commands may supersede command settings set by Workbench.
+
+!   Active UNIT system in Workbench when this object was created:  Metric (mm, kg, N, s, mV, mA)
+!   NOTE:  Any data that requires units (such as mass) is assumed to be in the consistent solver unit system.
+!                See Solving Units in the help system for more information.
+
+/SOLU
+
+/COM, HARMONIC BALANCE METHOD PARAMETERS
+PI      = ACOS(-1)
+FSTART  = 20/(2*PI)  ! STARTING FREQUENCY (HZ)
+FEND    = 350/(2*PI) ! ENDING   FREQUENCY (HZ)
+DS      = 5.0        ! INITIAL ARC LENGTH
+NH      = 1          ! NUMBER OF HBM HARMONICS
+NT      = 16  
++! NUMBER OF TIME POINTS PER PERIOD
+
+antype,harmic
+HROPT,HBM,NH
+HARFRQ,FSTART,FEND
+
+HBMOPT,AFT,,NT
+HBMOPT,CONTSET,,DS
+HBMOPT,SCAL,VALU,1e-5,200

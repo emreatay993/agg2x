@@ -1,0 +1,104 @@
+!   Commands inserted into this file will be executed just prior to the ANSYS SOLVE command.
+!   These commands may supersede command settings set by Workbench.
+
+!   Active UNIT system in Workbench when this object was created:  Metric (mm, kg, N, s, mV, mA)
+!   NOTE:  Any data that requires units (such as mass) is assumed to be in the consistent solver unit system.
+!                See Solving Units in the help system for more information.
+
+
+
+Kn = 1e3                            ! normal     stiffness
+Kt = 1e3                            ! tangential stiffness
+mu = 0.3                            ! friction coefficient
+
+/PREP7                      ! Allow input for PREP7 commands
+!--------------------------------------------------------------------------------------------------------------------------------
+
+ET, 1000000, 178            ! TYPE 1,000,000 Contact Element
+KEYOPT,1000000,5,5          ! Contact normal direction Y
+KEYOPT,1000000,2,0          ! Pure Penalty Method
+KEYOPT,1000000,10,7
+
+mp,mu,1000000,mu            ! Set frictional coefficient mu to a number 
+
+!r,1000000,-Kn,,,-Kt         ! Define real constant sets 1 and 4 (normal & tangential stiffness) for CONTA178 
+
+type,1000000                ! Activate element type attribute ID specified
+real,1000000                ! Activate real constant attribute ID specified
+mat ,1000000                ! Identifies the material number to be assigned to subsequently defined elements.
+
+CMSEL,S,sel
+eintf,,,HIGH
+ALLSEL
+
+FINISH
+
+
+
+
+
+
+
+
+
+
+!   R, NSET, R1, R2, R3, R4, R5, R6
+!   Defines the element real constants.
+
+!   NSET
+!   Real constant set identification number (arbitrary). 
+!   If same as a previous set number, set is redefined. 
+!   Set number relates to that defined with the element (REAL). 
+!   Note that the GUI automatically assigns this value.
+
+
+
+
+
+
+!   KEYOPT(2)
+!   Contact algorithm:
+
+!   0 -- 
+!   Augmented Lagrange method (default)
+
+!   1 -- 
+!   Pure Penalty method
+
+!   3 -- 
+!   Lagrange multiplier on contact normal and penalty on tangent (uses U/P formulation for normal contact, non-U/P formulation for tangential contact)
+
+!   4 -- 
+!   Lagrange multiplier method
+
+
+
+
+
+
+!   KEYOPT(5)
+!   Basis for contact normal:
+
+!   0 -- 
+!   Node locations or real constants NX, NY, NZ
+
+!   1 -- 
+!   X - component of nodal coordinate system (averaging on two contact nodes)
+
+!   2 -- 
+!   Y - component of nodal coordinate system (averaging on two contact nodes)
+
+!   3 -- 
+!   Z - component of nodal coordinate system (averaging on two contact nodes)
+
+!   4 -- 
+!   X - component of defined element coordinate system (ESYS)
+
+!   5 -- 
+!   Y - component of defined element coordinate system (ESYS)
+
+!   6 -- 
+!   Z - component of defined element coordinate system (ESYS)
+
+
+

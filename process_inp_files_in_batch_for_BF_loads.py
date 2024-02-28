@@ -1,5 +1,17 @@
+import clr
 import os
 import re
+
+# Add references to access Windows Forms components
+clr.AddReference('System.Windows.Forms')
+from System.Windows.Forms import FolderBrowserDialog, DialogResult
+
+def select_folder_dialog():
+    dialog = FolderBrowserDialog()
+    if dialog.ShowDialog() == DialogResult.OK:
+        return dialog.SelectedPath
+    else:
+        return None
 
 def process_inp_files(input_folder, output_folder_name):
     pattern = re.compile(r'^bf,')
@@ -18,9 +30,14 @@ def process_inp_files(input_folder, output_folder_name):
                     if pattern.match(line):
                         output_file.write(line)
 
-            # Updated print statement for compatibility with IronPython
             print("Processed {0} and saved output to {1}".format(filename, output_file_name))
 
-input_folder = r'path\to\your\input_folder'  # Update this to your actual input folder path
-process_inp_files(input_folder, "inp_files_BF_ONLY")
-print("All files processed successfully.")
+# Use the dialog to select the input folder
+input_folder = select_folder_dialog()
+
+if input_folder:
+    print("Selected folder: " + input_folder)
+    process_inp_files(input_folder, "inp_files_BF_ONLY")
+    print("All files processed successfully.")
+else:
+    print("No folder selected.")

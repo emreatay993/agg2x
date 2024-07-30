@@ -1,6 +1,6 @@
 import sys
 import pandas as pd
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget, QProgressBar
 import numpy as np
 import os
 
@@ -9,7 +9,7 @@ class DataProcessingApp(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Data Processing App")
-        self.setGeometry(100, 100, 400, 200)
+        self.setGeometry(100, 100, 400, 250)
 
         self.layout = QVBoxLayout()
 
@@ -45,6 +45,10 @@ class DataProcessingApp(QMainWindow):
         self.process_button.clicked.connect(self.process_data)
         self.layout.addWidget(self.process_button)
 
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setValue(0)
+        self.layout.addWidget(self.progress_bar)
+
         container = QWidget()
         container.setLayout(self.layout)
         self.setCentralWidget(container)
@@ -78,19 +82,22 @@ class DataProcessingApp(QMainWindow):
         angle_step = 360 / len(df)
         angles = np.arange(0, 360, angle_step)
 
-        if axis == "X":
-            repeated_data = pd.concat([df.assign(Y=df['Y'] * np.cos(np.deg2rad(angle)) - df['Z'] * np.sin(np.deg2rad(angle)),
-                                                 Z=df['Y'] * np.sin(np.deg2rad(angle)) + df['Z'] * np.cos(np.deg2rad(angle)))
-                                       for angle in angles])
-        elif axis == "Y":
-            repeated_data = pd.concat([df.assign(X=df['X'] * np.cos(np.deg2rad(angle)) + df['Z'] * np.sin(np.deg2rad(angle)),
-                                                 Z=-df['X'] * np.sin(np.deg2rad(angle)) + df['Z'] * np.cos(np.deg2rad(angle)))
-                                       for angle in angles])
-        else:
-            repeated_data = pd.concat([df.assign(X=df['X'] * np.cos(np.deg2rad(angle)) - df['Y'] * np.sin(np.deg2rad(angle)),
-                                                 Y=df['X'] * np.sin(np.deg2rad(angle)) + df['Y'] * np.cos(np.deg2rad(angle)))
-                                       for angle in angles])
+        repeated_data_list = []
+        for i, angle in enumerate(angles):
+            if axis == "X":
+                new_data = df.assign(Y=df['Y'] * np.cos(np.deg2rad(angle)) - df['Z'] * np.sin(np.deg2rad(angle)),
+                                     Z=df['Y'] * np.sin(np.deg2rad(angle)) + df['Z'] * np.cos(np.deg2rad(angle)))
+            elif axis == "Y":
+                new_data = df.assign(X=df['X'] * np.cos(np.deg2rad(angle)) + df['Z'] * np.sin(np.deg2rad(angle)),
+                                     Z=-df['X'] * np.sin(np.deg2rad(angle)) + df['Z'] * np.cos(np.deg2rad(angle)))
+            else:
+                new_data = df.assign(X=df['X'] * np.cos(np.deg2rad(angle)) - df['Y'] * np.sin(np.deg2rad(angle)),
+                                     Y=df['X'] * np.sin(np.deg2rad(angle)) + df['Y'] * np.cos(np.deg2rad(angle)))
 
+            repeated_data_list.append(new_data)
+            self.progress_bar.setValue(int((i + 1) / len(angles) * 100))
+
+        repeated_data = pd.concat(repeated_data_list)
         return repeated_data
 
     def save_data(self, data):
@@ -98,6 +105,7 @@ class DataProcessingApp(QMainWindow):
         output_file = f"{base_name}_full_360_data.csv"
         data.to_csv(output_file, index=False)
         self.file_label.setText(f"Data saved to: {output_file}")
+        self.progress_bar.setValue(100)
 
 def main():
     app = QApplication(sys.argv)

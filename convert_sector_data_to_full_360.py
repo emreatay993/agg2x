@@ -1,6 +1,6 @@
 import sys
 import pandas as pd
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget, QProgressBar
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget, QProgressBar, QLineEdit
 import numpy as np
 import os
 
@@ -9,7 +9,7 @@ class DataProcessingApp(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Data Processing App")
-        self.setGeometry(100, 100, 400, 250)
+        self.setGeometry(100, 100, 400, 300)
 
         self.layout = QVBoxLayout()
 
@@ -41,6 +41,13 @@ class DataProcessingApp(QMainWindow):
         self.axis_combobox.addItems(["X", "Y", "Z"])
         self.layout.addWidget(self.axis_combobox)
 
+        self.sectors_label = QLabel("Number of sectors (including original):", self)
+        self.layout.addWidget(self.sectors_label)
+
+        self.sectors_input = QSpinBox(self)
+        self.sectors_input.setMinimum(2)  # Minimum 2 sectors to include the original and one pattern
+        self.layout.addWidget(self.sectors_input)
+
         self.process_button = QPushButton("Process Data", self)
         self.process_button.clicked.connect(self.process_data)
         self.layout.addWidget(self.process_button)
@@ -66,38 +73,53 @@ class DataProcessingApp(QMainWindow):
             separator = self.separator_combobox.currentText()
             start_line = self.start_line_spinbox.value() - 1
             axis = self.axis_combobox.currentText()
+            sectors = self.sectors_input.value()
 
             if separator == "\\t":
                 separator = "\t"
 
-            df = pd.read_csv(self.file_path, sep=separator, skiprows=start_line, header=None)
+            df = pd.read_csv(self.file_path, sep=separator, skiprows=start_line, header=None, dtype=np.float32)
             df.columns = ['X', 'Y', 'Z', 'Field Data']
 
-            repeated_data = self.circular_patterning(df, axis)
+            repeated_data = self.circular_patterning(df, axis, sectors)
             self.save_data(repeated_data)
         except Exception as e:
             self.file_label.setText(f"Error: {str(e)}")
 
-    def circular_patterning(self, df, axis):
-        angle_step = 360 / len(df)
-        angles = np.arange(0, 360, angle_step)
+    def circular_patterning(self, df, axis, sectors):
+        angle_step = 360 / sectors
+        angles = np.arange(0, 360, angle_step, dtype=np.float32)
+        n_angles = len(angles)
 
-        repeated_data_list = []
-        for i, angle in enumerate(angles):
-            if axis == "X":
-                new_data = df.assign(Y=df['Y'] * np.cos(np.deg2rad(angle)) - df['Z'] * np.sin(np.deg2rad(angle)),
-                                     Z=df['Y'] * np.sin(np.deg2rad(angle)) + df['Z'] * np.cos(np.deg2rad(angle)))
-            elif axis == "Y":
-                new_data = df.assign(X=df['X'] * np.cos(np.deg2rad(angle)) + df['Z'] * np.sin(np.deg2rad(angle)),
-                                     Z=-df['X'] * np.sin(np.deg2rad(angle)) + df['Z'] * np.cos(np.deg2rad(angle)))
-            else:
-                new_data = df.assign(X=df['X'] * np.cos(np.deg2rad(angle)) - df['Y'] * np.sin(np.deg2rad(angle)),
-                                     Y=df['X'] * np.sin(np.deg2rad(angle)) + df['Y'] * np.cos(np.deg2rad(angle)))
+        x, y, z = df['X'].values, df['Y'].values, df['Z'].values
 
-            repeated_data_list.append(new_data)
-            self.progress_bar.setValue(int((i + 1) / len(angles) * 100))
+        if axis == "X":
+            sin_vals = np.sin(np.deg2rad(angles))
+            cos_vals = np.cos(np.deg2rad(angles))
+            new_y = np.repeat(y[:, np.newaxis], n_angles, axis=1) * cos_vals - np.repeat(z[:, np.newaxis], n_angles, axis=1) * sin_vals
+            new_z = np.repeat(y[:, np.newaxis], n_angles, axis=1) * sin_vals + np.repeat(z[:, np.newaxis], n_angles, axis=1) * cos_vals
+            new_x = np.repeat(x[:, np.newaxis], n_angles, axis=1)
+        elif axis == "Y":
+            sin_vals = np.sin(np.deg2rad(angles))
+            cos_vals = np.cos(np.deg2rad(angles))
+            new_x = np.repeat(x[:, np.newaxis], n_angles, axis=1) * cos_vals + np.repeat(z[:, np.newaxis], n_angles, axis=1) * sin_vals
+            new_z = -np.repeat(x[:, np.newaxis], n_angles, axis=1) * sin_vals + np.repeat(z[:, np.newaxis], n_angles, axis=1) * cos_vals
+            new_y = np.repeat(y[:, np.newaxis], n_angles, axis=1)
+        else:
+            sin_vals = np.sin(np.deg2rad(angles))
+            cos_vals = np.cos(np.deg2rad(angles))
+            new_x = np.repeat(x[:, np.newaxis], n_angles, axis=1) * cos_vals - np.repeat(y[:, np.newaxis], n_angles, axis=1) * sin_vals
+            new_y = np.repeat(x[:, np.newaxis], n_angles, axis=1) * sin_vals + np.repeat(y[:, np.newaxis], n_angles, axis=1) * cos_vals
+            new_z = np.repeat(z[:, np.newaxis], n_angles, axis=1)
 
-        repeated_data = pd.concat(repeated_data_list)
+        repeated_data = pd.DataFrame({
+            'X': new_x.flatten(),
+            'Y': new_y.flatten(),
+            'Z': new_z.flatten(),
+            'Field Data': np.tile(df['Field Data'].values, n_angles)
+        })
+
+        self.progress_bar.setValue(100)
         return repeated_data
 
     def save_data(self, data):

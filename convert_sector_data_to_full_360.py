@@ -1,6 +1,6 @@
 import sys
 import pandas as pd
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget, QProgressBar, QLineEdit
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget, QProgressBar
 import numpy as np
 import os
 
@@ -78,8 +78,11 @@ class DataProcessingApp(QMainWindow):
             if separator == "\\t":
                 separator = "\t"
 
-            df = pd.read_csv(self.file_path, sep=separator, skiprows=start_line, header=None, dtype=np.float32)
-            df.columns = ['X', 'Y', 'Z', 'Field Data']
+            if hasattr(self, 'file_path'):
+                df = pd.read_csv(self.file_path, sep=separator, skiprows=start_line, header=None, dtype=np.float32)
+                df.columns = ['X', 'Y', 'Z', 'Field Data']
+            else:
+                df = self.create_sample_data()
 
             repeated_data = self.circular_patterning(df, axis, sectors)
             self.save_data(repeated_data)
@@ -93,41 +96,54 @@ class DataProcessingApp(QMainWindow):
 
         x, y, z = df['X'].values, df['Y'].values, df['Z'].values
 
-        if axis == "X":
-            sin_vals = np.sin(np.deg2rad(angles))
-            cos_vals = np.cos(np.deg2rad(angles))
-            new_y = np.repeat(y[:, np.newaxis], n_angles, axis=1) * cos_vals - np.repeat(z[:, np.newaxis], n_angles, axis=1) * sin_vals
-            new_z = np.repeat(y[:, np.newaxis], n_angles, axis=1) * sin_vals + np.repeat(z[:, np.newaxis], n_angles, axis=1) * cos_vals
-            new_x = np.repeat(x[:, np.newaxis], n_angles, axis=1)
-        elif axis == "Y":
-            sin_vals = np.sin(np.deg2rad(angles))
-            cos_vals = np.cos(np.deg2rad(angles))
-            new_x = np.repeat(x[:, np.newaxis], n_angles, axis=1) * cos_vals + np.repeat(z[:, np.newaxis], n_angles, axis=1) * sin_vals
-            new_z = -np.repeat(x[:, np.newaxis], n_angles, axis=1) * sin_vals + np.repeat(z[:, np.newaxis], n_angles, axis=1) * cos_vals
-            new_y = np.repeat(y[:, np.newaxis], n_angles, axis=1)
-        else:
-            sin_vals = np.sin(np.deg2rad(angles))
-            cos_vals = np.cos(np.deg2rad(angles))
-            new_x = np.repeat(x[:, np.newaxis], n_angles, axis=1) * cos_vals - np.repeat(y[:, np.newaxis], n_angles, axis=1) * sin_vals
-            new_y = np.repeat(x[:, np.newaxis], n_angles, axis=1) * sin_vals + np.repeat(y[:, np.newaxis], n_angles, axis=1) * cos_vals
-            new_z = np.repeat(z[:, np.newaxis], n_angles, axis=1)
+        repeated_data_list = []
 
-        repeated_data = pd.DataFrame({
-            'X': new_x.flatten(),
-            'Y': new_y.flatten(),
-            'Z': new_z.flatten(),
-            'Field Data': np.tile(df['Field Data'].values, n_angles)
-        })
+        for angle in angles:
+            sin_angle = np.sin(np.deg2rad(angle))
+            cos_angle = np.cos(np.deg2rad(angle))
+            
+            if axis == "X":
+                new_y = y * cos_angle - z * sin_angle
+                new_z = y * sin_angle + z * cos_angle
+                new_x = x
+            elif axis == "Y":
+                new_x = x * cos_angle + z * sin_angle
+                new_z = -x * sin_angle + z * cos_angle
+                new_y = y
+            else:  # Z axis
+                new_x = x * cos_angle - y * sin_angle
+                new_y = x * sin_angle + y * cos_angle
+                new_z = z
+
+            repeated_data = pd.DataFrame({
+                'X': new_x,
+                'Y': new_y,
+                'Z': new_z,
+                'Field Data': df['Field Data'].values
+            })
+
+            repeated_data_list.append(repeated_data)
+
+        all_repeated_data = pd.concat(repeated_data_list, ignore_index=True)
 
         self.progress_bar.setValue(100)
-        return repeated_data
+        return all_repeated_data
 
     def save_data(self, data):
-        base_name = os.path.splitext(self.file_path)[0]
+        base_name = os.path.splitext(self.file_path)[0] if hasattr(self, 'file_path') else 'sample_data'
         output_file = f"{base_name}_full_360_data.csv"
         data.to_csv(output_file, index=False)
         self.file_label.setText(f"Data saved to: {output_file}")
         self.progress_bar.setValue(100)
+
+    def create_sample_data(self):
+        data = {
+            'X': np.array([1, 2, 3], dtype=np.float32),
+            'Y': np.array([4, 5, 6], dtype=np.float32),
+            'Z': np.array([7, 8, 9], dtype=np.float32),
+            'Field Data': np.array([10, 20, 30], dtype=np.float32)
+        }
+        return pd.DataFrame(data)
 
 def main():
     app = QApplication(sys.argv)

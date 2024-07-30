@@ -1,6 +1,6 @@
 import sys
 import pandas as pd
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget, QHBoxLayout
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget
 
 class DataProcessingApp(QMainWindow):
     def __init__(self):
@@ -22,7 +22,7 @@ class DataProcessingApp(QMainWindow):
         self.layout.addWidget(self.separator_label)
 
         self.separator_combobox = QComboBox(self)
-        self.separator_combobox.addItems([",", ";", "\t", " "])
+        self.separator_combobox.addItems([",", ";", "\\t", " "])
         self.layout.addWidget(self.separator_combobox)
 
         self.start_line_label = QLabel("Start reading from line:", self)
@@ -60,6 +60,9 @@ class DataProcessingApp(QMainWindow):
             separator = self.separator_combobox.currentText()
             start_line = self.start_line_spinbox.value() - 1
             axis = self.axis_combobox.currentText()
+
+            if separator == "\\t":
+                separator = "\t"
 
             df = pd.read_csv(self.file_path, sep=separator, skiprows=start_line, header=None)
             df.columns = ['X', 'Y', 'Z', 'Field Data']

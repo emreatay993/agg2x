@@ -1,6 +1,8 @@
 import sys
 import pandas as pd
 from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel, QVBoxLayout, QComboBox, QPushButton, QSpinBox, QWidget
+import numpy as np
+import os
 
 class DataProcessingApp(QMainWindow):
     def __init__(self):
@@ -67,13 +69,12 @@ class DataProcessingApp(QMainWindow):
             df = pd.read_csv(self.file_path, sep=separator, skiprows=start_line, header=None)
             df.columns = ['X', 'Y', 'Z', 'Field Data']
 
-            self.circular_patterning(df, axis)
+            repeated_data = self.circular_patterning(df, axis)
+            self.save_data(repeated_data)
         except Exception as e:
             self.file_label.setText(f"Error: {str(e)}")
 
     def circular_patterning(self, df, axis):
-        import numpy as np
-
         angle_step = 360 / len(df)
         angles = np.arange(0, 360, angle_step)
 
@@ -90,8 +91,13 @@ class DataProcessingApp(QMainWindow):
                                                  Y=df['X'] * np.sin(np.deg2rad(angle)) + df['Y'] * np.cos(np.deg2rad(angle)))
                                        for angle in angles])
 
-        print(repeated_data)
-        # Here you can save or further process the repeated_data as needed
+        return repeated_data
+
+    def save_data(self, data):
+        base_name = os.path.splitext(self.file_path)[0]
+        output_file = f"{base_name}_full_360_data.csv"
+        data.to_csv(output_file, index=False)
+        self.file_label.setText(f"Data saved to: {output_file}")
 
 def main():
     app = QApplication(sys.argv)

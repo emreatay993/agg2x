@@ -1,0 +1,32 @@
+# mos_app.py — MoS% Calculator with configurable preview cap
+# Default: MoS% = [1 - sigma_max / (YTS(T)/FS)] * 100
+# FS applies to YTS (allowable = YTS/FS). Preview table is capped for speed.
+
+import sys, os, re, time
+import numpy as np
+import pandas as pd
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+APP_NAME, VERSION = "MoS Calculator", "0.3.1"
+
+# ---------- utilities ----------
+def c_to_k(c): return c + 273.15
+def k_to_c(k): return k - 273.15
+
+def interp1_linear(x, xp, fp, extrap='clamp'):
+    xp = np.asarray(xp, dtype=float); fp = np.asarray(fp, dtype=float); x = np.asarray(x, dtype=float)
+    if xp.ndim != 1 or fp.ndim != 1 or xp.size != fp.size:
+        raise ValueError("xp and fp must be 1D and same length")
+    if np.any(np.diff(xp) <= 0):
+        raise ValueError("Material temperature column must be strictly increasing")
+    idx = np.searchsorted(xp, x, side='left')
+    idx = np.clip(idx, 1, len(xp)-1)
+    x0, x1 = xp[idx-1], xp[idx]; y0, y1 = fp[idx-1], fp[idx]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = (x - x0) / (x1 - x0)
+    y = y0 + t*(y1 - y0)
+    if extrap == 'clamp':
+        y = np.where(x <= xp[0], fp[0], np.where(x >= xp[-1], fp[-1], y))
+    elif extrap == 'error':
+        if np.any((x < xp[0]) | (x > xp[-1])): raise ValueError("Extrapolation outside material range")
+    elif extrap != 'linear':

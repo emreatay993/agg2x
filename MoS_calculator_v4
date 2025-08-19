@@ -1,0 +1,341 @@
+# mos_app.py — MoS% Calculator with configurable preview cap
+# Default: MoS% = [1 - sigma_max / (YTS(T)/FS)] * 100
+# FS applies to YTS (allowable = YTS/FS). Preview table is capped for speed.
+
+import sys, os, re, time
+import numpy as np
+import pandas as pd
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+APP_NAME, VERSION = "MoS Calculator", "0.3.1"
+
+# ---------- utilities ----------
+def c_to_k(c): return c + 273.15
+def k_to_c(k): return k - 273.15
+
+def interp1_linear(x, xp, fp, extrap='clamp'):
+    xp = np.asarray(xp, dtype=float); fp = np.asarray(fp, dtype=float); x = np.asarray(x, dtype=float)
+    if xp.ndim != 1 or fp.ndim != 1 or xp.size != fp.size:
+        raise ValueError("xp and fp must be 1D and same length")
+    if np.any(np.diff(xp) <= 0):
+        raise ValueError("Material temperature column must be strictly increasing")
+    idx = np.searchsorted(xp, x, side='left')
+    idx = np.clip(idx, 1, len(xp)-1)
+    x0, x1 = xp[idx-1], xp[idx]; y0, y1 = fp[idx-1], fp[idx]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        t = (x - x0) / (x1 - x0)
+    y = y0 + t*(y1 - y0)
+    if extrap == 'clamp':
+        y = np.where(x <= xp[0], fp[0], np.where(x >= xp[-1], fp[-1], y))
+    elif extrap == 'error':
+        if np.any((x < xp[0]) | (x > xp[-1])): raise ValueError("Extrapolation outside material range")
+    elif extrap != 'linear':
+        raise ValueError("Unknown extrapolation mode")
+    return y
+
+def guess_col(df, patterns):
+    pats = [re.compile(p, re.I) for p in patterns]
+    for col in df.columns:
+        name = str(col)
+        if any(p.search(name) for p in pats): return col
+    return None
+
+# ---------- Qt model ----------
+class PandasModel(QtCore.QAbstractTableModel):
+    def __init__(self, df=pd.DataFrame(), parent=None):
+        super().__init__(parent); self._df = df
+
+    def setDataFrame(self, df):
+        self.beginResetModel(); self._df = df.copy(); self.endResetModel()
+
+    def rowCount(self, parent=None): return 0 if parent and parent.isValid() else len(self._df.index)
+    def columnCount(self, parent=None): return 0 if parent and parent.isValid() else len(self._df.columns)
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):
+        if not index.isValid(): return None
+        if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+            return self._df.iat[index.row(), index.column()]
+        return None
+
+    def headerData(self, section, orientation, role):
+        if role != QtCore.Qt.DisplayRole: return None
+        return str(self._df.columns[section]) if orientation == QtCore.Qt.Horizontal else str(self._df.index[section])
+
+# ---------- worker ----------
+class ComputeWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(pd.DataFrame, dict, str)  # df, stats, err
+
+    def __init__(self, material, ansys, map_mat, map_ans, units, fs, extrap, percent=True):
+        super().__init__()
+        self.material, self.ansys = material, ansys
+        self.map_mat, self.map_ans = map_mat, map_ans
+        self.units, self.fs, self.extrap, self.percent = units, fs, extrap, percent
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            t0 = time.perf_counter()
+            # material
+            Tm = self.material[self.map_mat['temp']].to_numpy(dtype=float)
+            YTS = self.material[self.map_mat['yts']].to_numpy(dtype=float)
+            if self.units['mat_T'] == 'K': Tm = k_to_c(Tm)
+            order = np.argsort(Tm); Tm, YTS = Tm[order], YTS[order]
+            # ansys
+            node = self.ansys[self.map_ans['node']].to_numpy()
+            stress = self.ansys[self.map_ans['stress']].to_numpy(dtype=float)
+            Ta = self.ansys[self.map_ans['temp']].to_numpy(dtype=float)
+            if self.units['ans_T'] == 'K': Ta = k_to_c(Ta)
+            # compute
+            yts_at_T = interp1_linear(Ta, Tm, YTS, extrap=self.extrap)
+            allowable = yts_at_T / max(float(self.fs), 1e-12)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                mos_ratio = 1.0 - (stress / allowable)
+            mos = 100.0 * mos_ratio if self.percent else mos_ratio
+            # output
+            df_out = pd.DataFrame({
+                "NodeID": node, "Stress_MPa": stress, "Temp_C": Ta,
+                "YTS_at_T_MPa": yts_at_T, "Allowable_MPa": allowable
+            })
+            df_out["MoS_%" if self.percent else "MoS"] = mos
+            worst_idx = int(np.nanargmin(mos))
+            stats = {
+                "rows": int(df_out.shape[0]),
+                "num_negative": int(np.sum(mos < 0)),
+                "worst_node": str(df_out.iloc[worst_idx]["NodeID"]),
+                "worst_mos_percent": float(mos[worst_idx] if self.percent else mos_ratio[worst_idx]*100.0),
+                "t_compute_s": float(time.perf_counter() - t0)
+            }
+            self.finished.emit(df_out, stats, "")
+        except Exception as e:
+            self.finished.emit(pd.DataFrame(), {}, str(e))
+
+# ---------- main window ----------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} v{VERSION}"); self.resize(1280, 800)
+        self.material_df = pd.DataFrame(); self.ansys_df = pd.DataFrame(); self.results_df = pd.DataFrame()
+        self.dark_mode = True
+        self._build_ui(); self._apply_style()
+
+    # UI build
+    def _build_ui(self):
+        central = QtWidgets.QWidget(); self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        tb = QtWidgets.QToolBar(); tb.setMovable(False); self.addToolBar(tb)
+        act_theme = QtWidgets.QAction("Toggle Theme", self); act_theme.triggered.connect(self._toggle_theme); tb.addAction(act_theme)
+
+        self.tabs = QtWidgets.QTabWidget(); self.tabs.setTabPosition(QtWidgets.QTabWidget.West); layout.addWidget(self.tabs)
+        self._build_tab_material(); self._build_tab_ansys(); self._build_tab_compute(); self._build_tab_results()
+
+        self.status = QtWidgets.QStatusBar(); self.setStatusBar(self.status)
+
+    def _build_tab_material(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.btn_mat = QtWidgets.QPushButton("Load Material CSV/XLSX"); self.btn_mat.clicked.connect(self.load_material); top.addWidget(self.btn_mat)
+        top.addStretch(); top.addWidget(QtWidgets.QLabel("Material T units:"))
+        self.combo_mat_units = QtWidgets.QComboBox(); self.combo_mat_units.addItems(["C", "K"])
+        self.combo_mat_units.setCurrentText("C"); self.combo_mat_units.setMinimumWidth(140)
+        self.combo_mat_units.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        top.addWidget(self.combo_mat_units); v.addLayout(top)
+
+        form = QtWidgets.QFormLayout()
+        self.cb_mat_temp, self.cb_mat_yts = QtWidgets.QComboBox(), QtWidgets.QComboBox()
+        form.addRow("Temperature column", self.cb_mat_temp); form.addRow("Yield (YTS) column", self.cb_mat_yts); v.addLayout(form)
+
+        self.tbl_mat = QtWidgets.QTableView(); self.tbl_mat.setUniformRowHeights(True)
+        self.tbl_mat.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.model_mat = PandasModel(); self.tbl_mat.setModel(self.model_mat); self.tbl_mat.setSortingEnabled(True); v.addWidget(self.tbl_mat)
+        self.tabs.addTab(w, "Material DB")
+
+    def _build_tab_ansys(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.btn_ans = QtWidgets.QPushButton("Load ANSYS CSV/XLSX"); self.btn_ans.clicked.connect(self.load_ansys); top.addWidget(self.btn_ans)
+        top.addStretch(); top.addWidget(QtWidgets.QLabel("ANSYS T units:"))
+        self.combo_ans_units = QtWidgets.QComboBox(); self.combo_ans_units.addItems(["C", "K"])
+        self.combo_ans_units.setCurrentText("C"); self.combo_ans_units.setMinimumWidth(140)
+        self.combo_ans_units.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        top.addWidget(self.combo_ans_units); v.addLayout(top)
+
+        form = QtWidgets.QFormLayout()
+        self.cb_ans_node, self.cb_ans_stress, self.cb_ans_temp = QtWidgets.QComboBox(), QtWidgets.QComboBox(), QtWidgets.QComboBox()
+        form.addRow("Node ID column", self.cb_ans_node); form.addRow("Von Mises Stress column", self.cb_ans_stress); form.addRow("Temperature column", self.cb_ans_temp); v.addLayout(form)
+
+        self.tbl_ans = QtWidgets.QTableView(); self.tbl_ans.setUniformRowHeights(True)
+        self.tbl_ans.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.model_ans = PandasModel(); self.tbl_ans.setModel(self.model_ans); self.tbl_ans.setSortingEnabled(True); v.addWidget(self.tbl_ans)
+        self.tabs.addTab(w, "ANSYS Import")
+
+    def _build_tab_compute(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        form = QtWidgets.QFormLayout()
+        self.fs_spin = QtWidgets.QDoubleSpinBox(); self.fs_spin.setRange(0.01, 1000.0); self.fs_spin.setDecimals(3); self.fs_spin.setValue(1.0)
+        form.addRow("Factor of Safety (applied to YTS):", self.fs_spin)
+        self.combo_extrap = QtWidgets.QComboBox(); self.combo_extrap.addItems(["clamp", "linear", "error"])
+        form.addRow("Extrapolation policy:", self.combo_extrap)
+        self.chk_percent = QtWidgets.QCheckBox("Output MoS in percent"); self.chk_percent.setChecked(True); form.addRow("", self.chk_percent)
+        v.addLayout(form)
+
+        self.btn_compute = QtWidgets.QPushButton("Compute MoS"); self.btn_compute.clicked.connect(self.compute); v.addWidget(self.btn_compute)
+        self.lbl_summary = QtWidgets.QLabel("Summary: N/A"); v.addWidget(self.lbl_summary)
+        self.tabs.addTab(w, "Compute")
+
+    def _build_tab_results(self):
+        w = QtWidgets.QWidget(); v = QtWidgets.QVBoxLayout(w)
+        top = QtWidgets.QHBoxLayout()
+        self.btn_export = QtWidgets.QPushButton("Export CSV"); self.btn_export.clicked.connect(self.export_csv); top.addWidget(self.btn_export)
+        self.chk_only_neg = QtWidgets.QCheckBox("Show MoS < 0 only"); self.chk_only_neg.toggled.connect(self._apply_filter); top.addWidget(self.chk_only_neg)
+
+        top.addStretch()
+        top.addWidget(QtWidgets.QLabel("Max preview rows:"))
+        self.spin_cap = QtWidgets.QSpinBox(); self.spin_cap.setRange(1000, 2000000)
+        self.spin_cap.setSingleStep(1000); self.spin_cap.setValue(50000)
+        self.spin_cap.valueChanged.connect(self._apply_filter)
+        top.addWidget(self.spin_cap)
+        v.addLayout(top)
+
+        self.tbl_out = QtWidgets.QTableView(); self.tbl_out.setUniformRowHeights(True)
+        self.tbl_out.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.model_out = PandasModel(); self.tbl_out.setModel(self.model_out); self.tbl_out.setSortingEnabled(True); v.addWidget(self.tbl_out)
+        self.tabs.addTab(w, "Results")
+
+    # theme
+    def _toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self._apply_style()
+
+    def _apply_style(self):
+        if self.dark_mode:
+            self.setStyleSheet("""
+                QMainWindow, QWidget { background: #101012; color: #e5e5e5; }
+                QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTableView, QTextEdit {
+                    background: #1a1a1f; color: #e5e5e5; border: 1px solid #2a2a2f; }
+                QPushButton { background: #2a2a35; border: 1px solid #3a3a45; padding: 6px 10px; border-radius: 8px; }
+                QPushButton:hover { background: #343444; }
+                QHeaderView::section { background: #22222a; padding: 4px; border: none; }
+                QTabWidget::pane { border: 1px solid #2a2a2f; }
+                QTabBar::tab { padding: 8px; }
+            """)
+        else:
+            self.setStyleSheet("""
+                QMainWindow, QWidget { background: #fafafa; color: #111; }
+                QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTableView, QTextEdit {
+                    background: #ffffff; color: #111; border: 1px solid #cfcfcf; }
+                QPushButton { background: #f3f3f3; border: 1px solid #cfcfcf; padding: 6px 10px; border-radius: 8px; }
+                QPushButton:hover { background: #e9e9e9; }
+                QHeaderView::section { background: #f0f0f0; padding: 4px; border: 1px solid #dcdcdc; }
+                QTabWidget::pane { border: 1px solid #dcdcdc; }
+                QTabBar::tab { padding: 8px; }
+            """)
+
+    # ---------- IO ----------
+    def _read_any(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".csv", ".txt"):
+            try: return pd.read_csv(path, engine="pyarrow")
+            except Exception: return pd.read_csv(path)
+        if ext in (".xlsx", ".xls"): return pd.read_excel(path)
+        raise ValueError("Use CSV or XLSX")
+
+    def load_material(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Material File", "", "Data (*.csv *.xlsx)")
+        if not path: return
+        t0 = time.perf_counter()
+        try: df = self._read_any(path)
+        except Exception as e: QtWidgets.QMessageBox.critical(self, "Error", str(e)); return
+        self.material_df = df; self.model_mat.setDataFrame(df)
+        self.cb_mat_temp.clear(); self.cb_mat_yts.clear()
+        cols = [str(c) for c in df.columns]; self.cb_mat_temp.addItems(cols); self.cb_mat_yts.addItems(cols)
+        t_guess = guess_col(df, [r"temp"]); y_guess = guess_col(df, [r"yield", r"YTS", r"proof", r"Rp0[.,]2"])
+        if t_guess: self.cb_mat_temp.setCurrentText(str(t_guess))
+        if y_guess: self.cb_mat_yts.setCurrentText(str(y_guess))
+        self.status.showMessage(f"Material loaded in {time.perf_counter()-t0:.2f}s: {os.path.basename(path)}", 5000)
+
+    def load_ansys(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open ANSYS File", "", "Data (*.csv *.xlsx)")
+        if not path: return
+        t0 = time.perf_counter()
+        try: df = self._read_any(path)
+        except Exception as e: QtWidgets.QMessageBox.critical(self, "Error", str(e)); return
+        self.ansys_df = df; self.model_ans.setDataFrame(df)
+        self.cb_ans_node.clear(); self.cb_ans_stress.clear(); self.cb_ans_temp.clear()
+        cols = [str(c) for c in df.columns]
+        self.cb_ans_node.addItems(cols); self.cb_ans_stress.addItems(cols); self.cb_ans_temp.addItems(cols)
+        node_g = guess_col(df, [r"node", r"nid", r"\bid\b"])
+        stress_g = guess_col(df, [r"vm", r"von", r"mises", r"stress"])
+        temp_g = guess_col(df, [r"temp", r"T\(C|K\)"])
+        if node_g: self.cb_ans_node.setCurrentText(str(node_g))
+        if stress_g: self.cb_ans_stress.setCurrentText(str(stress_g))
+        if temp_g: self.cb_ans_temp.setCurrentText(str(temp_g))
+        self.status.showMessage(f"ANSYS loaded in {time.perf_counter()-t0:.2f}s: {os.path.basename(path)}", 5000)
+
+    # ---------- compute ----------
+    def compute(self):
+        if self.material_df.empty or self.ansys_df.empty:
+            QtWidgets.QMessageBox.warning(self, "Missing data", "Load both material and ANSYS files first."); return
+
+        map_mat = {"temp": self.cb_mat_temp.currentText(), "yts": self.cb_mat_yts.currentText()}
+        map_ans = {"node": self.cb_ans_node.currentText(), "stress": self.cb_ans_stress.currentText(), "temp": self.cb_ans_temp.currentText()}
+        units = {"mat_T": self.combo_mat_units.currentText(), "ans_T": self.combo_ans_units.currentText()}
+        fs = float(self.fs_spin.value()); extrap = self.combo_extrap.currentText(); percent = self.chk_percent.isChecked()
+
+        self.btn_compute.setEnabled(False); self.status.showMessage("Computing…")
+        self.thread = QtCore.QThread(); self.worker = ComputeWorker(self.material_df, self.ansys_df, map_mat, map_ans, units, fs, extrap, percent)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self._on_compute_done)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.start()
+
+    @QtCore.pyqtSlot(pd.DataFrame, dict, str)
+    def _on_compute_done(self, df, stats, err):
+        self.btn_compute.setEnabled(True)
+        if err:
+            QtWidgets.QMessageBox.critical(self, "Compute error", err); self.status.showMessage("Error", 5000); return
+        self.results_df = df; self._apply_filter()
+        s = f"Rows {stats['rows']} | MoS<0 {stats['num_negative']} | Worst Node {stats['worst_node']} | Worst MoS% {stats['worst_mos_percent']:.2f} | compute {stats['t_compute_s']:.2f}s"
+        self.lbl_summary.setText("Summary: " + s); self.status.showMessage("Done", 3000); self.tabs.setCurrentIndex(3)
+
+    # ---------- preview filter ----------
+    def _apply_filter(self):
+        if self.results_df.empty:
+            self.model_out.setDataFrame(self.results_df); return
+
+        col = "MoS_%" if "MoS_%" in self.results_df.columns else "MoS"
+        view = self.results_df[self.results_df[col] < 0] if self.chk_only_neg.isChecked() else self.results_df
+
+        cap = int(self.spin_cap.value())
+        if len(view) > cap:
+            vals = view[col].to_numpy()
+            k = min(cap, len(view))
+            idx = np.argpartition(vals, k-1)[:k]   # k smallest (worst)
+            view = view.iloc[idx].sort_values(col)
+
+        self.tbl_out.setUpdatesEnabled(False)
+        self.model_out.setDataFrame(view.reset_index(drop=True))
+        self.tbl_out.setUpdatesEnabled(True)
+
+    # ---------- export ----------
+    def export_csv(self):
+        if self.results_df.empty:
+            QtWidgets.QMessageBox.information(self, "No data", "Nothing to export."); return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Results CSV", "mos_results.csv", "CSV (*.csv)")
+        if not path: return
+        try: self.results_df.to_csv(path, index=False)
+        except Exception as e: QtWidgets.QMessageBox.critical(self, "Error", str(e)); return
+        self.status.showMessage(f"Saved: {os.path.basename(path)}", 5000)
+
+# ---------- main ----------
+def main():
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    app = QtWidgets.QApplication(sys.argv)
+    win = MainWindow(); win.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()

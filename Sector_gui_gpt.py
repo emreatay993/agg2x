@@ -1,0 +1,842 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+PyQt5 + PyVistaQt GUI for sector-duplicating point-cloud .dat files and visualizing them.
+
+Requirements:
+    pip install pyqt5 pyvista pyvistaqt pandas numpy
+
+Assumptions:
+    - Each .dat file has at least 4 whitespace-separated numeric columns.
+    - First 3 columns: X, Y, Z (Cartesian coordinates).
+    - 4th column: scalar Data to be visualized and duplicated.
+    - Sector duplication is rotation around the global Z-axis.
+"""
+
+import math
+from dataclasses import dataclass
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+from PyQt5.QtCore import (
+    Qt,
+    QAbstractTableModel,
+    QModelIndex,
+    QVariant,
+    pyqtSignal,
+)
+from PyQt5.QtGui import QPalette, QColor
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QTableView,
+    QSplitter,
+    QFileDialog,
+    QMessageBox,
+    QPlainTextEdit,
+    QHeaderView,
+)
+
+
+# -----------------------------
+# Data structures and utilities
+# -----------------------------
+
+
+@dataclass
+class FileEntry:
+    """Stores data and visualization info for a single .dat file."""
+
+    path: str
+    base_df: pd.DataFrame  # columns: X, Y, Z, Data
+    n_sectors: int = 1
+    total_angle_deg: float = 360.0
+    expanded_df: Optional[pd.DataFrame] = None
+    polydata: Optional[pv.PolyData] = None
+    scalar_min: float = 0.0
+    scalar_max: float = 0.0
+
+
+def expand_sectors(
+    base_df: pd.DataFrame,
+    n_sectors: int,
+    total_angle_deg: float,
+) -> pd.DataFrame:
+    """
+    Duplicate a base point cloud into sectors by rotating around Z-axis.
+
+    base_df: DataFrame with columns ["X", "Y", "Z", "Data"].
+    n_sectors: number of sectors to create.
+    total_angle_deg: total angle span (e.g. 360 degrees).
+
+    Returns:
+        DataFrame with columns ["X", "Y", "Z", "Data"] of size (N * n_sectors, 4).
+    """
+    if n_sectors < 1:
+        raise ValueError("Number of sectors must be >= 1")
+    if total_angle_deg <= 0.0:
+        raise ValueError("Total angle must be > 0")
+
+    # Ensure correct columns and dtypes
+    coords = base_df[["X", "Y", "Z"]].to_numpy(dtype=float)
+    data = base_df["Data"].to_numpy(dtype=float)
+
+    x = coords[:, 0]
+    y = coords[:, 1]
+    z = coords[:, 2]
+
+    all_points = []
+    all_data = []
+
+    delta_angle = float(total_angle_deg) / float(n_sectors)
+
+    for k in range(n_sectors):
+        angle_deg = k * delta_angle
+        angle_rad = math.radians(angle_deg)
+
+        cos_t = math.cos(angle_rad)
+        sin_t = math.sin(angle_rad)
+
+        x_rot = x * cos_t - y * sin_t
+        y_rot = x * sin_t + y * cos_t
+        z_rot = z  # unchanged
+
+        pts_k = np.column_stack((x_rot, y_rot, z_rot))
+        all_points.append(pts_k)
+        all_data.append(data)  # same scalar field
+
+    points = np.vstack(all_points)
+    values = np.hstack(all_data)
+
+    expanded_df = pd.DataFrame(points, columns=["X", "Y", "Z"])
+    expanded_df["Data"] = values
+
+    return expanded_df
+
+
+def make_polydata(df: pd.DataFrame) -> pv.PolyData:
+    """
+    Convert a DataFrame with columns ["X", "Y", "Z", "Data"] into a PyVista PolyData.
+    """
+    points = df[["X", "Y", "Z"]].to_numpy(dtype=float)
+    values = df["Data"].to_numpy(dtype=float)
+
+    poly = pv.PolyData(points)
+    poly["Data"] = values
+    return poly
+
+
+# -----------------------
+# Table model for the GUI
+# -----------------------
+
+
+class FileTableModel(QAbstractTableModel):
+    """
+    Table model backing the file list.
+
+    Columns:
+        0: File path (read-only)
+        1: Number of sectors (editable int)
+        2: Total angle [deg] (editable float)
+    """
+
+    parametersChanged = pyqtSignal(int, int)  # row, column
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._entries: List[FileEntry] = []
+
+    @property
+    def entries(self) -> List[FileEntry]:
+        return self._entries
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return len(self._entries)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return 3
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return QVariant()
+
+        if orientation == Qt.Horizontal:
+            if section == 0:
+                return "File"
+            elif section == 1:
+                return "Sectors"
+            elif section == 2:
+                return "Angle [deg]"
+        return QVariant()
+
+    def data(self, index: QModelIndex, role=Qt.DisplayRole):
+        if not index.isValid():
+            return QVariant()
+
+        row = index.row()
+        col = index.column()
+
+        if row < 0 or row >= len(self._entries):
+            return QVariant()
+
+        entry = self._entries[row]
+
+        if role == Qt.DisplayRole or role == Qt.EditRole:
+            if col == 0:
+                return entry.path
+            elif col == 1:
+                return str(entry.n_sectors)
+            elif col == 2:
+                return str(entry.total_angle_deg)
+
+        if role == Qt.ToolTipRole:
+            if col == 0:
+                return entry.path
+
+        return QVariant()
+
+    def flags(self, index: QModelIndex):
+        if not index.isValid():
+            return Qt.NoItemFlags
+
+        col = index.column()
+        base_flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+
+        if col in (1, 2):  # sectors and angle editable
+            return base_flags | Qt.ItemIsEditable
+        else:
+            return base_flags
+
+    def setData(self, index: QModelIndex, value, role=Qt.EditRole):
+        if role != Qt.EditRole or not index.isValid():
+            return False
+
+        row = index.row()
+        col = index.column()
+
+        if row < 0 or row >= len(self._entries):
+            return False
+
+        entry = self._entries[row]
+        text = str(value).strip()
+
+        if col == 1:
+            # Number of sectors
+            try:
+                n = int(text)
+                if n < 1:
+                    return False
+            except ValueError:
+                return False
+            if n == entry.n_sectors:
+                return False
+            entry.n_sectors = n
+
+        elif col == 2:
+            # Total angle
+            try:
+                angle = float(text)
+                if angle <= 0.0:
+                    return False
+            except ValueError:
+                return False
+            if math.isclose(angle, entry.total_angle_deg):
+                return False
+            entry.total_angle_deg = angle
+
+        else:
+            return False
+
+        self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+        self.parametersChanged.emit(row, col)
+        return True
+
+    def add_entries(self, new_entries: List[FileEntry]) -> int:
+        """
+        Append a list of FileEntry objects to the model.
+
+        Returns:
+            start_row of inserted items.
+        """
+        if not new_entries:
+            return len(self._entries)
+
+        start_row = len(self._entries)
+        end_row = start_row + len(new_entries) - 1
+
+        self.beginInsertRows(QModelIndex(), start_row, end_row)
+        self._entries.extend(new_entries)
+        self.endInsertRows()
+        return start_row
+
+    def remove_rows(self, rows: List[int]):
+        """
+        Remove rows by index (expects sorted in ascending order or any order;
+        will handle in descending internally).
+        """
+        if not rows:
+            return
+
+        # Remove in descending order to keep indices valid
+        for row in sorted(rows, reverse=True):
+            if 0 <= row < len(self._entries):
+                self.beginRemoveRows(QModelIndex(), row, row)
+                del self._entries[row]
+                self.endRemoveRows()
+
+
+# -----------------------
+# PyVista viewer widget
+# -----------------------
+
+
+class Viewer(QtInteractor):
+    """
+    PyVistaQt viewer with a context menu and simple modes:
+        - global: all files visible, global scalar bar
+        - focus: one file colored by scalar, others grey
+    """
+
+    requestGlobalView = pyqtSignal()
+    requestResetCamera = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_mode: str = "global"  # "global" or "focus"
+        self.focus_index: Optional[int] = None
+        self._has_camera: bool = False
+
+        # Visual tweaks
+        self.set_background("black")  # change to taste
+        self.show_axes()
+
+    def contextMenuEvent(self, event):
+        from PyQt5.QtWidgets import QMenu
+
+        menu = QMenu(self)
+
+        action_global = menu.addAction("Show all files (global view)")
+        action_reset = menu.addAction("Reset camera")
+
+        action = menu.exec_(event.globalPos())
+        if action == action_global:
+            self.requestGlobalView.emit()
+        elif action == action_reset:
+            self.requestResetCamera.emit()
+
+    def _store_camera_if_any(self):
+        """
+        Return camera position if a camera was set before; otherwise None.
+        """
+        if self._has_camera:
+            return self.camera_position
+        return None
+
+    def _restore_or_reset_camera(self, camera_position):
+        """
+        Restore camera if camera_position is not None, otherwise reset.
+        """
+        if camera_position is None:
+            self.reset_camera()
+            self._has_camera = True
+        else:
+            self.camera_position = camera_position
+            self._has_camera = True
+
+    def show_global(self, entries: List[FileEntry]):
+        """
+        Show all files with a global scalar bar range.
+        """
+        self.current_mode = "global"
+        self.focus_index = None
+
+        camera = self._store_camera_if_any()
+        self.clear()
+
+        if not entries:
+            self.render()
+            return
+
+        # Determine global scalar range
+        scalar_mins = [e.scalar_min for e in entries]
+        scalar_maxs = [e.scalar_max for e in entries]
+        global_min = float(min(scalar_mins))
+        global_max = float(max(scalar_maxs))
+
+        # Draw all meshes
+        for entry in entries:
+            if entry.polydata is None:
+                continue
+            self.add_mesh(
+                entry.polydata,
+                scalars="Data",
+                clim=(global_min, global_max),
+                show_scalar_bar=False,
+                render_points_as_spheres=True,
+                point_size=4.0,
+            )
+
+        # Add a single scalar bar
+        self.add_scalar_bar(title="Data", clim=(global_min, global_max))
+
+        self._restore_or_reset_camera(camera)
+        self.render()
+
+    def show_focus(self, entries: List[FileEntry], focus_index: int):
+        """
+        Show a focused view on a single file, with other files in grey.
+        """
+        if not entries:
+            self.clear()
+            self.render()
+            return
+
+        if focus_index < 0 or focus_index >= len(entries):
+            # Fallback to global view if index is invalid
+            self.show_global(entries)
+            return
+
+        self.current_mode = "focus"
+        self.focus_index = focus_index
+
+        camera = self._store_camera_if_any()
+        self.clear()
+
+        focus_entry = entries[focus_index]
+        local_min = float(focus_entry.scalar_min)
+        local_max = float(focus_entry.scalar_max)
+
+        # Draw meshes: focus file colored, others grey/transparent
+        for idx, entry in enumerate(entries):
+            if entry.polydata is None:
+                continue
+
+            if idx == focus_index:
+                self.add_mesh(
+                    entry.polydata,
+                    scalars="Data",
+                    clim=(local_min, local_max),
+                    show_scalar_bar=False,
+                    render_points_as_spheres=True,
+                    point_size=5.0,
+                )
+            else:
+                self.add_mesh(
+                    entry.polydata,
+                    color="lightgray",
+                    opacity=0.15,
+                    render_points_as_spheres=True,
+                    point_size=3.0,
+                    show_scalar_bar=False,
+                )
+
+        # Add scalar bar for the focused file
+        self.add_scalar_bar(title="Data", clim=(local_min, local_max))
+
+        self._restore_or_reset_camera(camera)
+        self.render()
+
+    def reset_camera_view(self):
+        self.reset_camera()
+        self._has_camera = True
+        self.render()
+
+
+# ---------------
+# Main window GUI
+# ---------------
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Sector Duplicator & Point Cloud Viewer")
+        self.resize(1400, 800)
+
+        self.model = FileTableModel(self)
+
+        self._build_ui()
+        self._connect_signals()
+
+    # ---- UI setup ----
+
+    def _build_ui(self):
+        splitter = QSplitter(Qt.Horizontal, self)
+        self.setCentralWidget(splitter)
+
+        # Left panel: controls + table
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(6, 6, 6, 6)
+        left_layout.setSpacing(6)
+
+        button_layout = QHBoxLayout()
+        self.btn_add_files = QPushButton("Add Files…")
+        self.btn_remove_selected = QPushButton("Remove Selected")
+        self.btn_export_csv = QPushButton("Export Expanded CSV")
+
+        button_layout.addWidget(self.btn_add_files)
+        button_layout.addWidget(self.btn_remove_selected)
+        button_layout.addWidget(self.btn_export_csv)
+        button_layout.addStretch(1)
+
+        self.table_view = QTableView()
+        self.table_view.setModel(self.model)
+        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.setSelectionMode(QTableView.ExtendedSelection)
+        self.table_view.setAlternatingRowColors(True)
+        self.table_view.setSortingEnabled(False)
+
+        header = self.table_view.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+
+        left_layout.addLayout(button_layout)
+        left_layout.addWidget(self.table_view)
+
+        # Right panel: viewer + log
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(6, 6, 6, 6)
+        right_layout.setSpacing(6)
+
+        self.viewer = Viewer(right_widget)
+
+        self.log_widget = QPlainTextEdit()
+        self.log_widget.setReadOnly(True)
+        self.log_widget.setMaximumHeight(120)
+
+        right_layout.addWidget(self.viewer, stretch=1)
+        right_layout.addWidget(self.log_widget, stretch=0)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+    def _connect_signals(self):
+        self.btn_add_files.clicked.connect(self.on_add_files)
+        self.btn_remove_selected.clicked.connect(self.on_remove_selected)
+        self.btn_export_csv.clicked.connect(self.on_export_csv)
+
+        self.model.parametersChanged.connect(self.on_parameters_changed)
+
+        # table selection -> viewer focus
+        self.table_view.selectionModel().selectionChanged.connect(
+            self.on_selection_changed
+        )
+
+        # viewer context menu actions
+        self.viewer.requestGlobalView.connect(self.on_request_global_view)
+        self.viewer.requestResetCamera.connect(self.on_request_reset_camera)
+
+    # ---- Logging ----
+
+    def log(self, text: str):
+        self.log_widget.appendPlainText(text)
+
+    # ---- Model / data helpers ----
+
+    def _validate_and_load_file(self, path: str) -> (Optional[FileEntry], Optional[str]):
+        """
+        Try to read and validate a single .dat file.
+
+        Returns:
+            (entry, None) if successful
+            (None, reason) if failed
+        """
+        try:
+            # Strict .dat extension check can be relaxed if needed
+            if not path.lower().endswith(".dat"):
+                return None, "File does not have .dat extension."
+
+            # Read whitespace-separated, no header
+            df = pd.read_csv(path, delim_whitespace=True, header=None)
+
+            if df.shape[1] < 4:
+                return None, f"Expected at least 4 numeric columns, found {df.shape[1]}."
+
+            sub = df.iloc[:, :4].astype(float)  # may raise ValueError
+
+            base_df = sub.copy()
+            base_df.columns = ["X", "Y", "Z", "Data"]
+
+            scalar_min = float(base_df["Data"].min())
+            scalar_max = float(base_df["Data"].max())
+
+            entry = FileEntry(
+                path=path,
+                base_df=base_df,
+                n_sectors=1,
+                total_angle_deg=360.0,
+                expanded_df=None,
+                polydata=None,
+                scalar_min=scalar_min,
+                scalar_max=scalar_max,
+            )
+            return entry, None
+
+        except Exception as exc:
+            return None, f"Error reading file: {exc}"
+
+    def _recompute_entry_geometry(self, row: int):
+        """
+        Recompute the expanded DataFrame and PolyData for a given row.
+        """
+        if row < 0 or row >= len(self.model.entries):
+            return
+
+        entry = self.model.entries[row]
+        try:
+            expanded_df = expand_sectors(
+                entry.base_df,
+                entry.n_sectors,
+                entry.total_angle_deg,
+            )
+            entry.expanded_df = expanded_df
+            entry.polydata = make_polydata(expanded_df)
+        except Exception as exc:
+            self.log(f"Error expanding sectors for row {row}: {exc}")
+            entry.expanded_df = None
+            entry.polydata = None
+
+    def _refresh_view(self):
+        """
+        Redraw the viewer according to current mode and data state.
+        """
+        entries = self.model.entries
+        if not entries:
+            self.viewer.clear()
+            self.viewer.render()
+            return
+
+        if self.viewer.current_mode == "focus":
+            idx = self.viewer.focus_index
+            if idx is not None and 0 <= idx < len(entries):
+                self.viewer.show_focus(entries, idx)
+            else:
+                self.viewer.show_global(entries)
+        else:
+            self.viewer.show_global(entries)
+
+    # ---- Slots / event handlers ----
+
+    def on_add_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select DAT files",
+            "",
+            "DAT files (*.dat);;All Files (*)",
+        )
+        if not paths:
+            return
+
+        valid_entries: List[FileEntry] = []
+        invalid_messages: List[str] = []
+
+        existing_paths = {e.path for e in self.model.entries}
+
+        for path in paths:
+            if path in existing_paths:
+                invalid_messages.append(f"{path}: already loaded, skipped.")
+                continue
+
+            entry, reason = self._validate_and_load_file(path)
+            if entry is not None:
+                valid_entries.append(entry)
+            else:
+                invalid_messages.append(f"{path}: {reason}")
+
+        if invalid_messages:
+            msg = "Some files were skipped:\n\n" + "\n".join(invalid_messages)
+            QMessageBox.warning(self, "File validation", msg)
+            for line in invalid_messages:
+                self.log(line)
+
+        if not valid_entries:
+            return
+
+        start_row = self.model.add_entries(valid_entries)
+        # Recompute geometry for newly added entries
+        for i in range(len(valid_entries)):
+            row = start_row + i
+            self._recompute_entry_geometry(row)
+
+        # Show all in global view
+        self.viewer.show_global(self.model.entries)
+        self.log(f"Added {len(valid_entries)} file(s).")
+
+    def on_remove_selected(self):
+        selection_model = self.table_view.selectionModel()
+        selected_rows = sorted({idx.row() for idx in selection_model.selectedRows()})
+
+        if not selected_rows:
+            return
+
+        # Just for logging
+        removed_paths = [self.model.entries[r].path for r in selected_rows]
+
+        self.model.remove_rows(selected_rows)
+
+        # After removing entries, refresh view
+        self._refresh_view()
+
+        # Clear selection
+        self.table_view.clearSelection()
+
+        for p in removed_paths:
+            self.log(f"Removed file: {p}")
+
+    def on_export_csv(self):
+        entries = self.model.entries
+        if not entries:
+            QMessageBox.information(self, "Export CSV", "No data to export.")
+            return
+
+        # Ensure all expanded data is up to date
+        for row in range(len(entries)):
+            self._recompute_entry_geometry(row)
+
+        frames = []
+        for entry in entries:
+            if entry.expanded_df is not None:
+                frames.append(entry.expanded_df)
+
+        if not frames:
+            QMessageBox.warning(
+                self, "Export CSV", "No expanded data available to export."
+            )
+            return
+
+        df_all = pd.concat(frames, ignore_index=True)
+        df_all = df_all[["X", "Y", "Z", "Data"]]  # ensure correct order
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save expanded data as CSV",
+            "",
+            "CSV files (*.csv);;All Files (*)",
+        )
+        if not out_path:
+            return
+
+        try:
+            df_all.to_csv(out_path, index=False)
+            self.log(f"Exported expanded data to: {out_path}")
+            QMessageBox.information(
+                self, "Export CSV", f"Expanded data saved to:\n{out_path}"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export CSV", f"Failed to save CSV:\n{exc}")
+            self.log(f"Error exporting CSV: {exc}")
+
+    def on_parameters_changed(self, row: int, column: int):
+        """
+        Triggered when sectors or total angle is edited in the table.
+        """
+        self._recompute_entry_geometry(row)
+        self._refresh_view()
+        self.log(
+            f"Updated parameters for row {row}: "
+            f"sectors={self.model.entries[row].n_sectors}, "
+            f"angle={self.model.entries[row].total_angle_deg}"
+        )
+
+    def on_selection_changed(self, selected, deselected):
+        """
+        When the user selects a row, focus the view on that file.
+        If no selection, show global view.
+        """
+        selection_model = self.table_view.selectionModel()
+        rows = sorted({idx.row() for idx in selection_model.selectedRows()})
+
+        entries = self.model.entries
+
+        if not entries:
+            self.viewer.clear()
+            self.viewer.render()
+            return
+
+        if not rows:
+            # No selection -> global view
+            self.viewer.show_global(entries)
+            return
+
+        focus_row = rows[0]
+        self.viewer.show_focus(entries, focus_row)
+
+    def on_request_global_view(self):
+        """
+        Right-click context menu: show all files.
+        """
+        # Clear selection so that global state is consistent
+        self.table_view.clearSelection()
+        self.viewer.show_global(self.model.entries)
+
+    def on_request_reset_camera(self):
+        """
+        Right-click context menu: reset camera.
+        """
+        self.viewer.reset_camera_view()
+
+
+# ---------------
+# Application main
+# ---------------
+
+
+def _set_modern_palette(app: QApplication):
+    """
+    Set a simple modern darkish Fusion palette.
+    """
+    app.setStyle("Fusion")
+    palette = QPalette()
+
+    base_color = QColor(53, 53, 53)
+    text_color = QColor(220, 220, 220)
+    highlight_color = QColor(42, 130, 218)
+
+    palette.setColor(QPalette.Window, base_color)
+    palette.setColor(QPalette.WindowText, text_color)
+    palette.setColor(QPalette.Base, QColor(35, 35, 35))
+    palette.setColor(QPalette.AlternateBase, base_color)
+    palette.setColor(QPalette.ToolTipBase, text_color)
+    palette.setColor(QPalette.ToolTipText, text_color)
+    palette.setColor(QPalette.Text, text_color)
+    palette.setColor(QPalette.Button, base_color)
+    palette.setColor(QPalette.ButtonText, text_color)
+    palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+    palette.setColor(QPalette.Highlight, highlight_color)
+    palette.setColor(QPalette.HighlightedText, QColor(0, 0, 0))
+
+    app.setPalette(palette)
+
+
+def main():
+    import sys
+
+    pv.set_plot_theme("dark")  # optional, keeps things consistent
+
+    app = QApplication(sys.argv)
+    _set_modern_palette(app)
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

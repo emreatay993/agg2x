@@ -155,6 +155,7 @@ class FileTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._entries: List[FileEntry] = []
+        self._dirty_rows: set = set()  # Track rows that need geometry recomputation
 
     @property
     def entries(self) -> List[FileEntry]:
@@ -216,6 +217,19 @@ class FileTableModel(QAbstractTableModel):
             return base_flags | Qt.ItemIsEditable
         else:
             return base_flags
+
+    def mark_row_dirty(self, row: int):
+        """Mark a row as needing geometry recomputation."""
+        if 0 <= row < len(self._entries):
+            self._dirty_rows.add(row)
+
+    def clear_dirty_rows(self):
+        """Clear all dirty row markers."""
+        self._dirty_rows.clear()
+
+    def get_dirty_rows(self) -> set:
+        """Get all rows marked as dirty."""
+        return self._dirty_rows.copy()
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole):
         if role != Qt.EditRole or not index.isValid():
@@ -293,6 +307,10 @@ class FileTableModel(QAbstractTableModel):
                 self.beginRemoveRows(QModelIndex(), row, row)
                 del self._entries[row]
                 self.endRemoveRows()
+                # Clean up dirty rows tracking
+                self._dirty_rows.discard(row)
+                # Adjust other dirty row indices
+                self._dirty_rows = {r - 1 if r > row else r for r in self._dirty_rows}
 
 
 # -----------------------
@@ -465,6 +483,11 @@ class MainWindow(QMainWindow):
         self.resize(1400, 800)
 
         self.model = FileTableModel(self)
+        
+        # State tracking for manual update controls
+        self._auto_update_enabled = True
+        self._needs_update = False
+        self._last_selected_column = None  # Track which column was last selected
 
         self._build_ui()
         self._connect_signals()
@@ -490,6 +513,17 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.btn_remove_selected)
         button_layout.addWidget(self.btn_export_csv)
         button_layout.addStretch(1)
+        
+        # Add manual update controls
+        update_controls_layout = QHBoxLayout()
+        self.chk_auto_update = QCheckBox("Auto-Update PyVista")
+        self.chk_auto_update.setChecked(True)
+        self.btn_update_screen = QPushButton("Update Screen")
+        self.btn_update_screen.setMinimumWidth(120)
+        
+        update_controls_layout.addWidget(self.chk_auto_update)
+        update_controls_layout.addWidget(self.btn_update_screen)
+        update_controls_layout.addStretch(1)
 
         self.table_view = QTableView()
         self.table_view.setModel(self.model)
@@ -504,6 +538,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
 
         left_layout.addLayout(button_layout)
+        left_layout.addLayout(update_controls_layout)
         left_layout.addWidget(self.table_view)
 
         # Right panel: viewer + log
@@ -530,6 +565,10 @@ class MainWindow(QMainWindow):
         self.btn_add_files.clicked.connect(self.on_add_files)
         self.btn_remove_selected.clicked.connect(self.on_remove_selected)
         self.btn_export_csv.clicked.connect(self.on_export_csv)
+        
+        # Manual update controls
+        self.chk_auto_update.toggled.connect(self.on_auto_update_toggled)
+        self.btn_update_screen.clicked.connect(self.on_manual_update)
 
         self.model.parametersChanged.connect(self.on_parameters_changed)
 
@@ -674,15 +713,23 @@ class MainWindow(QMainWindow):
             row = start_row + i
             self._recompute_entry_geometry(row)
 
-        # Show all in global view
-        self.viewer.show_global(self.model.entries)
+        # Mark as needing update
+        self._mark_needs_update()
+        
+        # Show all in global view if auto-update is enabled
+        if self._auto_update_enabled:
+            self._apply_updates()
+        
         self.log(f"Added {len(valid_entries)} file(s).")
 
     def on_remove_selected(self):
         selection_model = self.table_view.selectionModel()
-        selected_rows = sorted({idx.row() for idx in selection_model.selectedRows()})
+        # Get selected rows from either row selection or cell selection
+        selected_indexes = selection_model.selectedIndexes()
+        selected_rows = sorted(set(idx.row() for idx in selected_indexes))
 
         if not selected_rows:
+            QMessageBox.information(self, "Remove Files", "No rows selected.")
             return
 
         # Just for logging
@@ -690,9 +737,13 @@ class MainWindow(QMainWindow):
 
         self.model.remove_rows(selected_rows)
 
-        # After removing entries, refresh view
-        self._refresh_view()
-
+        # Mark as needing update
+        self._mark_needs_update()
+        
+        # Apply update if auto-update is enabled
+        if self._auto_update_enabled:
+            self._apply_updates()
+        
         # Clear selection
         self.table_view.clearSelection()
 
@@ -746,21 +797,42 @@ class MainWindow(QMainWindow):
         """
         Triggered when sectors or total angle is edited in the table.
         """
-        self._recompute_entry_geometry(row)
-        self._refresh_view()
-        self.log(
-            f"Updated parameters for row {row}: "
-            f"sectors={self.model.entries[row].n_sectors}, "
-            f"angle={self.model.entries[row].total_angle_deg}"
-        )
+        if self._auto_update_enabled:
+            # Immediately recompute and update view
+            self._recompute_entry_geometry(row)
+            self._refresh_view()
+            self.log(
+                f"Updated parameters for row {row}: "
+                f"sectors={self.model.entries[row].n_sectors}, "
+                f"angle={self.model.entries[row].total_angle_deg}"
+            )
+        else:
+            # Mark as dirty and defer update
+            self.model.mark_row_dirty(row)
+            self._mark_needs_update()
+            self.log(
+                f"Parameters changed for row {row} (pending update): "
+                f"sectors={self.model.entries[row].n_sectors}, "
+                f"angle={self.model.entries[row].total_angle_deg}"
+            )
 
     def on_selection_changed(self, selected, deselected):
         """
-        When the user selects a row, focus the view on that file.
-        If no selection, show global view.
+        When the user selects filepath cells, focus the view on that file.
+        Selecting sector/angle cells alone does NOT trigger replot.
         """
         selection_model = self.table_view.selectionModel()
-        rows = sorted({idx.row() for idx in selection_model.selectedRows()})
+        selected_indexes = selection_model.selectedIndexes()
+        
+        # Check if any selected index is in column 0 (filepath)
+        has_filepath_selection = any(idx.column() == 0 for idx in selected_indexes)
+        
+        # Only update view if filepath cells are selected
+        if not has_filepath_selection:
+            return
+        
+        # Get selected rows
+        rows = sorted(set(idx.row() for idx in selected_indexes if idx.column() == 0))
 
         entries = self.model.entries
 
@@ -770,7 +842,7 @@ class MainWindow(QMainWindow):
             return
 
         if not rows:
-            # No selection -> global view
+            # No filepath selection -> global view
             self.viewer.show_global(entries)
             return
 
@@ -790,6 +862,66 @@ class MainWindow(QMainWindow):
         Right-click context menu: reset camera.
         """
         self.viewer.reset_camera_view()
+    
+    # ---- Manual update controls ----
+    
+    def on_auto_update_toggled(self, checked: bool):
+        """
+        Handle auto-update checkbox toggle.
+        """
+        self._auto_update_enabled = checked
+        if checked and self._needs_update:
+            # If re-enabling auto-update and there are pending changes, apply them
+            self._apply_updates()
+        self.log(f"Auto-update {'enabled' if checked else 'disabled'}.")
+    
+    def on_manual_update(self):
+        """
+        Handle manual update button click.
+        """
+        if not self._needs_update:
+            self.log("Screen is already up-to-date.")
+            return
+        
+        self._apply_updates()
+        self.log("Screen updated manually.")
+    
+    def _mark_needs_update(self):
+        """
+        Mark that PyVista screen needs updating and style the update button.
+        """
+        if not self._needs_update:
+            self._needs_update = True
+            # Set button style to reddish to indicate update needed
+            self.btn_update_screen.setStyleSheet(
+                "background-color: #8B4513; font-weight: bold; color: white;"
+            )
+    
+    def _clear_needs_update(self):
+        """
+        Clear the needs update flag and restore button style.
+        """
+        self._needs_update = False
+        self.btn_update_screen.setStyleSheet("")  # Reset to default style
+    
+    def _apply_updates(self):
+        """
+        Apply all pending geometry recomputations and refresh the view.
+        """
+        dirty_rows = self.model.get_dirty_rows()
+        
+        # Recompute geometry for all dirty rows
+        for row in dirty_rows:
+            self._recompute_entry_geometry(row)
+        
+        # Clear dirty rows
+        self.model.clear_dirty_rows()
+        
+        # Refresh view
+        self._refresh_view()
+        
+        # Clear update needed flag
+        self._clear_needs_update()
 
 
 # ---------------

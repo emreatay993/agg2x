@@ -30,7 +30,7 @@ from PyQt5.QtCore import (
     QVariant,
     pyqtSignal,
 )
-from PyQt5.QtGui import QPalette, QColor
+from PyQt5.QtGui import QPalette, QColor, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -44,6 +44,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QHeaderView,
+    QShortcut,
 )
 
 
@@ -333,6 +334,8 @@ class Viewer(QtInteractor):
         self.current_mode: str = "global"  # "global" or "focus"
         self.focus_index: Optional[int] = None
         self._has_camera: bool = False
+        self.point_size: float = 4.0  # Default point size
+        self.focus_point_size: float = 5.0  # Default focused point size
 
         # Visual tweaks
         self.set_background("black")  # change to taste
@@ -392,20 +395,26 @@ class Viewer(QtInteractor):
         global_max = float(max(scalar_maxs))
 
         # Draw all meshes
+        mesh_actor = None
         for entry in entries:
             if entry.polydata is None:
                 continue
-            self.add_mesh(
+            actor = self.add_mesh(
                 entry.polydata,
                 scalars="Data",
+                cmap="jet",
                 clim=(global_min, global_max),
                 show_scalar_bar=False,
                 render_points_as_spheres=True,
-                point_size=4.0,
+                point_size=self.point_size,
             )
+            # Store the first mesh actor for scalar bar reference
+            if mesh_actor is None:
+                mesh_actor = actor
 
-        # Add a single scalar bar
-        self.add_scalar_bar(title="Data", clim=(global_min, global_max))
+        # Add a single scalar bar using the mesh actor
+        if mesh_actor is not None:
+            self.add_scalar_bar(title="Data", mapper=mesh_actor.GetMapper())
 
         self._restore_or_reset_camera(camera)
         self.render()
@@ -435,18 +444,20 @@ class Viewer(QtInteractor):
         local_max = float(focus_entry.scalar_max)
 
         # Draw meshes: focus file colored, others grey/transparent
+        focus_actor = None
         for idx, entry in enumerate(entries):
             if entry.polydata is None:
                 continue
 
             if idx == focus_index:
-                self.add_mesh(
+                focus_actor = self.add_mesh(
                     entry.polydata,
                     scalars="Data",
+                    cmap="jet",
                     clim=(local_min, local_max),
                     show_scalar_bar=False,
                     render_points_as_spheres=True,
-                    point_size=5.0,
+                    point_size=self.focus_point_size,
                 )
             else:
                 self.add_mesh(
@@ -454,12 +465,13 @@ class Viewer(QtInteractor):
                     color="lightgray",
                     opacity=0.15,
                     render_points_as_spheres=True,
-                    point_size=3.0,
+                    point_size=self.point_size * 0.75,  # Slightly smaller for background
                     show_scalar_bar=False,
                 )
 
-        # Add scalar bar for the focused file
-        self.add_scalar_bar(title="Data", clim=(local_min, local_max))
+        # Add scalar bar for the focused file using its mapper
+        if focus_actor is not None:
+            self.add_scalar_bar(title="Data", mapper=focus_actor.GetMapper())
 
         self._restore_or_reset_camera(camera)
         self.render()
@@ -468,6 +480,18 @@ class Viewer(QtInteractor):
         self.reset_camera()
         self._has_camera = True
         self.render()
+
+    def increase_point_size(self):
+        """Increase point size by 1 unit."""
+        self.point_size += 1.0
+        self.focus_point_size += 1.0
+        return self.point_size
+
+    def decrease_point_size(self):
+        """Decrease point size by 1 unit (minimum 1.0)."""
+        self.point_size = max(1.0, self.point_size - 1.0)
+        self.focus_point_size = max(1.0, self.focus_point_size - 1.0)
+        return self.point_size
 
 
 # ---------------
@@ -580,6 +604,13 @@ class MainWindow(QMainWindow):
         # viewer context menu actions
         self.viewer.requestGlobalView.connect(self.on_request_global_view)
         self.viewer.requestResetCamera.connect(self.on_request_reset_camera)
+        
+        # Keyboard shortcuts for point size control
+        self.shortcut_increase_size = QShortcut(QKeySequence("Ctrl++"), self)
+        self.shortcut_increase_size.activated.connect(self.on_increase_point_size)
+        
+        self.shortcut_decrease_size = QShortcut(QKeySequence("Ctrl+-"), self)
+        self.shortcut_decrease_size.activated.connect(self.on_decrease_point_size)
 
     # ---- Logging ----
 
@@ -862,6 +893,24 @@ class MainWindow(QMainWindow):
         Right-click context menu: reset camera.
         """
         self.viewer.reset_camera_view()
+    
+    # ---- Keyboard shortcuts ----
+    
+    def on_increase_point_size(self):
+        """
+        Handle Ctrl + (Plus) shortcut to increase point size.
+        """
+        new_size = self.viewer.increase_point_size()
+        self._refresh_view()
+        self.log(f"Point size increased to {new_size:.1f}")
+    
+    def on_decrease_point_size(self):
+        """
+        Handle Ctrl + (Minus) shortcut to decrease point size.
+        """
+        new_size = self.viewer.decrease_point_size()
+        self._refresh_view()
+        self.log(f"Point size decreased to {new_size:.1f}")
     
     # ---- Manual update controls ----
     

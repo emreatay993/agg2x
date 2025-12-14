@@ -1,0 +1,119 @@
+$ =============================================================================
+$ NASTRAN SOL 112 - MODAL TRANSIENT ANALYSIS
+$ Cantilever Beam with Sinusoidal Tip Load
+$ Outputs modal coordinates to punch file
+$ =============================================================================
+NASTRAN SYSTEM(316)=19
+INIT MASTER(S)
+SOL 112
+TIME 600
+CEND
+$
+$ =============================================================================
+$ CASE CONTROL SECTION
+$ =============================================================================
+TITLE = CANTILEVER BEAM MODAL TRANSIENT
+SUBTITLE = MODAL COORDINATES OUTPUT
+ECHO = NONE
+$
+$ Global settings
+SPC = 1
+METHOD = 100
+SDAMPING = 1
+$
+$ Single transient subcase
+SUBCASE 1
+  LABEL = SINUSOIDAL TIP LOAD
+  TSTEP = 200
+  DLOAD = 300
+  DISPLACEMENT(PRINT,PUNCH) = ALL
+  VELOCITY(PRINT) = ALL
+  ACCELERATION(PRINT) = ALL
+  SDISPLACEMENT(PRINT,PUNCH) = ALL
+  SVELOCITY(PRINT,PUNCH) = ALL
+  SACCELERATION(PRINT,PUNCH) = ALL
+$
+BEGIN BULK
+$
+$ --- PARAMETERS ---
+PARAM   POST    -1
+PARAM   PRTMAXIM YES
+PARAM   COUPMASS 1
+$
+$ --- EIGENVALUE METHOD (Lanczos, 10 modes, 0-1000 Hz) ---
+EIGRL   100     0.0     1000.0  10
+$
+$ --- TIME STEPPING (500 steps x 0.002s = 1.0 sec) ---
+TSTEP   200     500     0.002   1
+$
+$ --- MODAL DAMPING (2% critical damping) ---
+TABDMP1 1       CRIT
+        0.0     0.02    10000.0 0.02    ENDT
+$
+$ --- DYNAMIC LOADING ---
+$ DLOAD combines loads: scale=1.0, load 301 with scale 1.0
+DLOAD   300     1.0     1.0     301
+$
+$ TLOAD1: Time-dependent load using table
+$ SID, EXCITEID, DELAY, TYPE, TID
+$ TYPE=0 means force, TID references TABLED1
+TLOAD1  301     400             0       500
+$
+$ DAREA: Defines load location and magnitude
+$ SID, GRID, DOF, AMPLITUDE
+DAREA   400     11      3       1000.0
+$
+$ TABLED1: Sinusoidal function table (10 Hz sine wave)
+$ One full period = 0.1 sec, so for 1 sec we need 10 periods
+$ sin(2*pi*10*t) values at key points
+TABLED1 500
+        0.000   0.0     0.025   1.0     0.050   0.0     0.075   -1.0
+        0.100   0.0     0.125   1.0     0.150   0.0     0.175   -1.0
+        0.200   0.0     0.225   1.0     0.250   0.0     0.275   -1.0
+        0.300   0.0     0.325   1.0     0.350   0.0     0.375   -1.0
+        0.400   0.0     0.425   1.0     0.450   0.0     0.475   -1.0
+        0.500   0.0     0.525   1.0     0.550   0.0     0.575   -1.0
+        0.600   0.0     0.625   1.0     0.650   0.0     0.675   -1.0
+        0.700   0.0     0.725   1.0     0.750   0.0     0.775   -1.0
+        0.800   0.0     0.825   1.0     0.850   0.0     0.875   -1.0
+        0.900   0.0     0.925   1.0     0.950   0.0     0.975   -1.0
+        1.000   0.0     ENDT
+$
+$ --- GEOMETRY: CANTILEVER BEAM (10 elements, 11 nodes) ---
+$ Length = 1000 mm along X-axis
+$ Cross-section: 20mm x 20mm square steel
+$
+GRID    1               0.0     0.0     0.0
+GRID    2               100.0   0.0     0.0
+GRID    3               200.0   0.0     0.0
+GRID    4               300.0   0.0     0.0
+GRID    5               400.0   0.0     0.0
+GRID    6               500.0   0.0     0.0
+GRID    7               600.0   0.0     0.0
+GRID    8               700.0   0.0     0.0
+GRID    9               800.0   0.0     0.0
+GRID    10              900.0   0.0     0.0
+GRID    11              1000.0  0.0     0.0
+$
+$ Beam elements (CBAR)
+CBAR    1       1       1       2       0.0     1.0     0.0
+CBAR    2       1       2       3       0.0     1.0     0.0
+CBAR    3       1       3       4       0.0     1.0     0.0
+CBAR    4       1       4       5       0.0     1.0     0.0
+CBAR    5       1       5       6       0.0     1.0     0.0
+CBAR    6       1       6       7       0.0     1.0     0.0
+CBAR    7       1       7       8       0.0     1.0     0.0
+CBAR    8       1       8       9       0.0     1.0     0.0
+CBAR    9       1       9       10      0.0     1.0     0.0
+CBAR    10      1       10      11      0.0     1.0     0.0
+$
+$ Beam property (20x20mm square: A=400, I=13333.33, J=21000)
+PBAR    1       1       400.0   13333.3313333.33 21000.0
+$
+$ Material: Steel (E=210 GPa, rho=7.85e-9 tonne/mm^3)
+MAT1    1       210000.0        0.3     7.85E-9
+$
+$ Fixed boundary at root (all 6 DOFs)
+SPC1    1       123456  1
+$
+ENDDATA

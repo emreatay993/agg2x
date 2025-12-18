@@ -1,0 +1,23 @@
+! How to use it in Mechanical:
+!   Place a Commands object under Static Structural / Command (Right-Click Menu)
+!   Set the "Step Selection Mode" as "All"
+!   Set the "Issue Solve Command" as "No"
+
+
+/COM, ============================================================
+/COM, Solve each load step and print inertia relief summary (IRLIST)
+/COM, Mechanical settings for THIS Commands (APDL) object:
+/COM,   - Step Selection Mode = All
+/COM,   - Issue Solve Command = No
+/COM, ============================================================
+
+/SOLU
+ALLSEL,ALL
+
+!! Optional: show which step we're on (NCMLS = load steps completed prior to current solve)
+!*GET,_lsdone,ACTIVE,0,SOLU,NCMLS
+!*VWRITE,_lsdone
+!('--- About to SOLVE load step (index based on prior solves) NCMLS = ',I8,' ---')
+
+SOLVE
+IRLIST

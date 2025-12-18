@@ -57,12 +57,11 @@ MPDELE,THSZ,ALL
 
   *IF,elib,GE,171,THEN
     *IF,elib,LE,177,THEN
-      ! MPC bonded contact (effectively linear in this mode)
-      KEYOPT,etid,2,2
+      ! KEYOPT,etid,2,2          ! MPC bonded contact
       KEYOPT,etid,12,5
     *ELSEIF,elib,EQ,178,THEN
       ! Bonded contact that preserves initial open/closed state
-      KEYOPT,etid,10,6
+      KEYOPT,etid,10,6         ! CONTA178 uses KEYOPT(10) for bonded / no-separation options
     *ENDIF
   *ENDIF
 *ENDDO

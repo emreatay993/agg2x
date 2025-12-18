@@ -1,0 +1,83 @@
+! =====================================================================
+! Linearize model + enable inertia relief (run BEFORE SOLVE)
+!
+! 1) Delete bolt pretension elements (PRETS179)
+! 2) Convert contact elements (CONTA171..178) to BONDED
+! 3) Turn OFF large-deflection effects
+! 4) Delete ALL nonlinear material TB tables
+! 5) Deactivate thermal strain effects (delete all CTE-type MP properties)
+! 6) Enable inertia relief (static)
+!
+! Recommended placement in Mechanical:
+!   Commands object under Static Structural / Command (Right-Click Menu)
+! =====================================================================
+
+/COM, --- Linearize + inertia relief + remove pretension + remove thermal strain ---
+
+! Save current selections
+CM,_SEL_ELEM,ELEM
+CM,_SEL_NODE,NODE
+
+ALLSEL,ALL
+
+FINISH
+/PREP7
+
+! --- (1) Delete bolt pretension elements: PRETS179
+ESEL,S,ENAME,,179          ! select all PRETS179 elements (bolt pretension)
+*GET,_npre,ELEM,0,COUNT
+*IF,_npre,GT,0,THEN
+  EDELE,ALL                ! delete selected pretension elements
+  ! NUMCMP,ELEM             ! optional: compress null elements
+*ENDIF
+ALLSEL,ALL
+
+! --- (4) Remove ALL material nonlinear TB tables for all materials
+TBDELE,ALL,ALL
+
+! --- (5) Deactivate thermal strain effects (thermal expansion coefficients)
+! Delete all common thermal-expansion MP labels (including isotropic and orthotropic forms)
+MPDELE,ALPX,ALL
+MPDELE,ALPY,ALL
+MPDELE,ALPZ,ALL
+MPDELE,CTEX,ALL
+MPDELE,CTEY,ALL
+MPDELE,CTEZ,ALL
+MPDELE,THSX,ALL
+MPDELE,THSY,ALL
+MPDELE,THSZ,ALL
+
+! --- (2) Convert all contact element TYPES to BONDED
+*GET,etmax,ETYP,0,NUM,MAX
+
+*DO,etid,1,etmax
+  *GET,elib,ETYP,etid,ATTR,ENAM   ! 171..178 => CONTA171..CONTA178
+
+  *IF,elib,GE,171,THEN
+    *IF,elib,LE,177,THEN
+      ! MPC bonded contact (effectively linear in this mode)
+      KEYOPT,etid,2,2
+      KEYOPT,etid,12,5
+    *ELSEIF,elib,EQ,178,THEN
+      ! Bonded contact that preserves initial open/closed state
+      KEYOPT,etid,10,6
+    *ENDIF
+  *ENDIF
+*ENDDO
+
+FINISH
+/SOLU
+
+! --- (3) Turn OFF geometric nonlinearity (large deflection)
+NLGEOM,OFF
+
+! --- (6) Enable inertia relief (issue before SOLVE)
+IRLF,1
+
+! Restore selections and clean up
+CMSEL,S,_SEL_ELEM
+CMSEL,S,_SEL_NODE
+CMDELE,_SEL_ELEM
+CMDELE,_SEL_NODE
+
+/COM, --- Preconditioning for Linear Inertia Relief Analysis Setup is Completed ---

@@ -8,8 +8,10 @@
 ! 5) Deactivate thermal strain effects (delete all CTE-type MP properties)
 ! 6) Enable inertia relief (static)
 !
-! Recommended placement in Mechanical:
-!   Commands object under Static Structural / Command (Right-Click Menu)
+! How to use it in Mechanical:
+!   Place a Commands object under Static Structural / Command (Right-Click Menu)
+!   Set the "Step Selection Mode" as "First"
+!   Set the "Issue Solve Command as "No"
 ! =====================================================================
 
 /COM, --- Linearize + inertia relief + remove pretension + remove thermal strain ---
@@ -72,6 +74,7 @@ FINISH
 NLGEOM,OFF
 
 ! --- (6) Enable inertia relief (issue before SOLVE)
+ematwrite,yes   ! make sure writing emat file since have irlf
 IRLF,1
 
 ! Restore selections and clean up

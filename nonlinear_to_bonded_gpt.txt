@@ -1,0 +1,48 @@
+! =====================================================================
+! Convert all "nonlinear" contact elements (CONTA17x) in the model to BONDED
+! Intended use (Workbench Mechanical): put this in a Commands object under
+!   Solution (so it runs right before the solver starts).
+!
+! What it does:
+!   - For CONTA171..CONTA177: sets KEYOPT(12)=5  (bonded-always) 0
+!   - For CONTA178:          sets KEYOPT(10)=4  (bonded)        1
+!
+! Implementation notes:
+!   - Loops over *defined element types* and detects contact types by ETYP,ATTR,ENAM 2
+!   - Uses *GET,ETYP,0,NUM,MAX to find the max type number 3
+! =====================================================================
+
+/COM, --- Force all CONTA17x contacts to BONDED (before SOLVE) ---
+
+! Save current selections
+CM,_SEL_ELEM,ELEM
+CM,_SEL_NODE,NODE
+
+ALLSEL,ALL
+
+FINISH
+/PREP7
+
+*GET,etmax,ETYP,0,NUM,MAX     ! max defined element type number 4
+
+*DO,etid,1,etmax
+  *GET,elib,ETYP,etid,ATTR,ENAM   ! element "library number": 174=CONTA174, 170=TARGE170, etc. 5
+
+  ! CONTA171..CONTA177: contact interface behavior is KEYOPT(12)
+  *IF,elib,GE,171,THEN
+    *IF,elib,LE,177,THEN
+      KEYOPT,etid,12,5            ! bonded-always (fully bonded) 6
+    *ELSEIF,elib,EQ,178,THEN
+      KEYOPT,etid,10,4            ! CONTA178 uses KEYOPT(10) for bonded 7
+    *ENDIF
+  *ENDIF
+*ENDDO
+
+FINISH
+/SOLU
+
+! Restore selections
+CMSEL,S,_SEL_ELEM
+CMSEL,S,_SEL_NODE
+CMDELE,_SEL_ELEM
+CMDELE,_SEL_NODE

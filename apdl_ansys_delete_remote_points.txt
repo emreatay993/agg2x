@@ -1,0 +1,57 @@
+! ============================================================
+! Delete MAPDL entities for given Remote Point pilot nodes:
+! - constraint equations involving pilot node
+! - coupled DOF sets involving pilot node
+! - MPC elements attached to pilot node (common for remote couplings)
+! - optional: delete pilot node itself
+! Assumption: NO loads exist on these pilot nodes.
+! ============================================================
+
+FINISH
+/PREP7
+ALLSEL,ALL
+
+*DIM,RPN,ARRAY,2
+RPN(1) = RP_DENEME
+RPN(2) = RP_OTHER
+
+*DO,i,1,2
+  nd = RPN(i)
+
+  ! Skip if node doesn't exist
+  NSEL,S,NODE,,nd
+  *GET,nexist,NODE,0,COUNT
+  *IF,nexist,EQ,0,THEN
+    ALLSEL,ALL
+    *CYCLE
+  *ENDIF
+
+  ! 1) Delete constraint equations that include this node
+  !    (uses current NSEL; Nsel=ANY means delete any set containing selected node)
+  CEDELE,ALL,,,ANY
+
+  ! 2) Delete coupled-DOF sets that include this node
+  CPDELE,ALL,,,ANY
+
+  ALLSEL,ALL
+
+  ! 3) Delete MPC elements attached to the pilot node (if any)
+  ESEL,S,NODE,,nd
+  ! Optional safety filter (uncomment if you only want MPC184):
+  !ESEL,R,ENAME,,MPC184
+  *GET,ne,ELEM,0,COUNT
+  *IF,ne,GT,0,THEN
+    EDELE,ALL
+  *ENDIF
+  ALLSEL,ALL
+
+  ! 4) Optional: delete the pilot node itself
+  NSEL,S,NODE,,nd
+  NDELE,ALL
+  ALLSEL,ALL
+
+*ENDDO
+
+FINISH
+/SOLU
+! ============================================================

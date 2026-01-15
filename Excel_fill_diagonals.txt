@@ -1,0 +1,15 @@
+Sub FillDiagonal136()
+    Dim i As Long, j As Long
+
+    ' Fill entire 136x136 block with 0
+    For i = 1 To 136
+        For j = 1 To 136
+            Cells(i, j).Value = 0
+        Next j
+    Next i
+
+    ' Set main diagonal to 1
+    For i = 1 To 136
+        Cells(i, i).Value = 1
+    Next i
+End Sub

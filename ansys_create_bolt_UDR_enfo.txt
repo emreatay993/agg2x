@@ -1,0 +1,227 @@
+# IronPython script for ANSYS Mechanical (tested syntax style for 2023R2+)
+
+import clr
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (
+    Form, Label, ListBox, Button, DialogResult,
+    MessageBox, MessageBoxButtons, MessageBoxIcon, FormStartPosition
+)
+from System.Drawing import Point, Size
+
+EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ", "ENMOX", "ENMOY", "ENMOZ"]
+
+
+def is_type(obj, type_name):
+    try:
+        return obj is not None and obj.GetType().Name == type_name
+    except:
+        return False
+
+
+def get_selected_grouping_folders():
+    folders = []
+    try:
+        active = ExtAPI.DataModel.Tree.ActiveObjects
+    except:
+        active = None
+
+    if active is None:
+        return folders
+
+    for obj in active:
+        if is_type(obj, "TreeGroupingFolder"):
+            folders.append(obj)
+    return folders
+
+
+def collect_named_selections_recursive(folder, out_list, seen_ids):
+    if folder is None:
+        return
+
+    try:
+        children = folder.Children
+    except:
+        children = None
+
+    if children is None:
+        return
+
+    for child in children:
+        if child is None:
+            continue
+
+        if is_type(child, "NamedSelection"):
+            try:
+                suppressed = bool(child.Suppressed)
+            except:
+                suppressed = False
+
+            if suppressed:
+                continue
+
+            try:
+                oid = child.ObjectId
+            except:
+                oid = child.Name
+
+            if oid in seen_ids:
+                continue
+
+            seen_ids.add(oid)
+            out_list.append(child)
+
+        elif is_type(child, "TreeGroupingFolder"):
+            collect_named_selections_recursive(child, out_list, seen_ids)
+
+
+def choose_analysis(analyses):
+    if analyses is None or len(analyses) == 0:
+        return None
+    if len(analyses) == 1:
+        return analyses[0]
+
+    form = Form()
+    form.Text = "Select Analysis Environment"
+    form.StartPosition = FormStartPosition.CenterScreen
+    form.Size = Size(500, 380)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+
+    label = Label()
+    label.Text = "Select target analysis for Bolt Results:"
+    label.Location = Point(12, 12)
+    label.AutoSize = True
+    form.Controls.Add(label)
+
+    listbox = ListBox()
+    listbox.Location = Point(12, 38)
+    listbox.Size = Size(460, 260)
+    for ana in analyses:
+        listbox.Items.Add(ana.Name)
+    if listbox.Items.Count > 0:
+        listbox.SelectedIndex = 0
+    form.Controls.Add(listbox)
+
+    ok_button = Button()
+    ok_button.Text = "OK"
+    ok_button.Location = Point(316, 310)
+    ok_button.DialogResult = DialogResult.OK
+    form.Controls.Add(ok_button)
+
+    cancel_button = Button()
+    cancel_button.Text = "Cancel"
+    cancel_button.Location = Point(397, 310)
+    cancel_button.DialogResult = DialogResult.Cancel
+    form.Controls.Add(cancel_button)
+
+    form.AcceptButton = ok_button
+    form.CancelButton = cancel_button
+
+    result = form.ShowDialog()
+    if result != DialogResult.OK or listbox.SelectedIndex < 0:
+        return None
+
+    return analyses[listbox.SelectedIndex]
+
+
+def scope_udr_to_named_selection(udr, ns):
+    # Preferred: keep NS-based scoping
+    try:
+        udr.Location = ns
+        return True
+    except:
+        pass
+
+    # Fallback: geometry selection from NS
+    try:
+        udr.Location = ns.Location
+        return True
+    except:
+        return False
+
+
+def make_unique_name(base_name, used_names):
+    name = base_name
+    i = 1
+    while name in used_names:
+        name = "{}_{}".format(base_name, i)
+        i += 1
+    used_names.add(name)
+    return name
+
+
+def run():
+    selected_folders = get_selected_grouping_folders()
+    if len(selected_folders) == 0:
+        MessageBox.Show(
+            "Please select one or more grouping folders that contain Named Selections.",
+            "Bolt UDR Generator",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return
+
+    analyses = list(Model.Analyses)
+    target_analysis = choose_analysis(analyses)
+    if target_analysis is None:
+        return
+
+    named_selections = []
+    seen_ids = set()
+    for folder in selected_folders:
+        collect_named_selections_recursive(folder, named_selections, seen_ids)
+
+    if len(named_selections) == 0:
+        MessageBox.Show(
+            "No unsuppressed Named Selections were found under the selected grouping folder(s).",
+            "Bolt UDR Generator",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information
+        )
+        return
+
+    solution = target_analysis.Solution
+    tree = ExtAPI.DataModel.Tree
+
+    expr_folders = []
+    failed_scopes = []
+    used_names = set()
+    created_count = 0
+
+    with Transaction():
+        for expr in EXPRESSIONS:
+            expr_results = []
+
+            for ns in named_selections:
+                udr = solution.AddUserDefinedResult()
+                udr.Expression = expr
+                udr.Name = make_unique_name("{}_{}".format(expr, ns.Name), used_names)
+
+                if not scope_udr_to_named_selection(udr, ns):
+                    failed_scopes.append(udr.Name)
+
+                expr_results.append(udr)
+                created_count += 1
+
+            expr_folder = tree.Group(expr_results)
+            expr_folder.Name = expr
+            expr_folders.append(expr_folder)
+
+        bolt_folder = tree.Group(expr_folders)
+        bolt_folder.Name = "Bolt Results"
+
+    msg = (
+        "Created {0} User Defined Results in analysis '{1}'.\n"
+        "Named Selections used: {2}\n"
+        "Expression groups: {3}"
+    ).format(created_count, target_analysis.Name, len(named_selections), len(EXPRESSIONS))
+
+    if len(failed_scopes) > 0:
+        msg += "\n\nWarning: {} result(s) could not be scoped automatically.".format(len(failed_scopes))
+
+    MessageBox.Show(msg, "Bolt UDR Generator", MessageBoxButtons.OK, MessageBoxIcon.Information)
+
+
+run()

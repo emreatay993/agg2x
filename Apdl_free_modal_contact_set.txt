@@ -1,0 +1,152 @@
+! ------------------------------------------------------------
+! FREE-FREE MODAL CONTACT/TARGET KEYOPT BATCH EDIT (AUTOFIX ONLY)
+!
+! Goal: reduce risk of artificial grounding caused by
+!  - rigid target auto-constraints (TARGE169/170 KEYOPT(2))
+!  - surface-based constraints / MPC DOF masks (TARGE170 KEYOPT(4))
+!  - bonded contact formulations (CONTA17x KEYOPT(2/4/12))
+!
+! Put this in a Mechanical Command Snippet that runs BEFORE SOLVE.
+! ------------------------------------------------------------
+
+FINISH
+/PREP7
+ALLSEL,ALL
+
+! =========================
+! USER CONFIG (EDIT HERE)
+! =========================
+SKIP_GENERAL_CONTACT = 1      ! 1=skip GCGEN general contact (RC=0 & SEC>0), 0=touch everything
+
+APPLY_ONLY_BONDED = 1         ! 1=only modify CONTA17x types that are already bonded (KEYOPT(12)=3/5/6)
+                              ! 0=apply to all CONTA17x types found
+
+! ---- TARGET elements (TARGE169/170) ----
+TARG_SET_KO2  = 1             ! KEYOPT(2) Boundary conditions for rigid target nodes:
+                              !   0 = program may automatically constrain rigid target nodes (static/full transient)
+                              !   1 = specified by user (disables auto-fixing; helps free-free modal)
+
+TARG_SET_KO4  = -1            ! KEYOPT(4) DOF set used in internally-generated MPCs (DOF mask ROTZ ROTY ROTX UZ UY UX):
+                              !   Example: 111000 -> only UX,UY,UZ constrained (no rotations)
+                              !   0 or 111111 -> all DOFs constrained
+                              !   -1 -> do not change
+
+TARG_SET_KO10 = -1            ! KEYOPT(10) Stress stiffening for MPC force-distributed/rigid constraints:
+                              !   0 = off, 1 = on, -1 = do not change
+                              !   (Only relevant if you later do prestressed modal / surface-based constraints w/ MPC)
+
+! ---- CONTACT elements (CONTA171..178) ----
+CONT_SET_KO2  = -1            ! KEYOPT(2) Contact algorithm:
+                              !   0=Augmented Lagrange, 1=Penalty, 2=MPC, 3=LM(normal)+penalty(tangent), 4=Pure LM
+                              !   -1 -> do not change
+
+CONT_SET_KO4  = -1            ! KEYOPT(4) Two meanings:
+                              !   Standard contact: detection point method
+                              !     0=Gauss point, 1=nodal normal from contact, 2=nodal normal to target, 3/4/5=projection-based
+                              !   Surface-based constraints (typically with KEYOPT(12)=5/6):
+                              !     1=force-distributed, 2=rigid surface (for CONTA172/174), 3=coupling constraint (MPC only)
+                              !   -1 -> do not change
+
+CONT_SET_KO12 = -1            ! KEYOPT(12) Contact behavior:
+                              !   0=standard, 1=rough, 2=no-sep(sliding), 3=bonded,
+                              !   4=no-sep(always), 5=bonded(always), 6=bonded(initial)
+                              !   -1 -> do not change
+
+! =========================
+! END USER CONFIG
+! =========================
+
+! Select contact+target elements
+ESEL,S,ENAME,,169
+ESEL,A,ENAME,,170
+*DO,I,171,178
+  ESEL,A,ENAME,,I
+*ENDDO
+
+*GET,NE,ELEM,0,COUNT
+*IF,NE,LE,0,THEN
+  ALLSEL,ALL
+  FINISH
+  *RETURN
+*ENDIF
+
+EID = ELNEXT(0)
+*DO,II,1,NE
+
+  *GET,ETID,ELEM,EID,ATTR,TYPE
+  *GET,ENAM,ELEM,EID,ATTR,ENAM
+  *GET,RCID,ELEM,EID,ATTR,REAL
+  *GET,SECID,ELEM,EID,ATTR,SEC
+
+  ! Optionally skip General Contact (GCGEN): RCID=0 and SECID>0
+  *IF,SKIP_GENERAL_CONTACT,EQ,1,THEN
+    *IF,RCID,EQ,0,THEN
+      *IF,SECID,GT,0,THEN
+        EID = ELNEXT(EID)
+        *CYCLE
+      *ENDIF
+    *ENDIF
+  *ENDIF
+
+  ! =========================
+  ! TARGET FIXES (TARGE169/170)
+  ! =========================
+  *IF,ENAM,EQ,169,THEN
+    *IF,TARG_SET_KO2,NE,-1,THEN
+      KEYOPT,ETID,2,TARG_SET_KO2
+    *ENDIF
+    *IF,TARG_SET_KO4,NE,-1,THEN
+      KEYOPT,ETID,4,TARG_SET_KO4
+    *ENDIF
+    *IF,TARG_SET_KO10,NE,-1,THEN
+      KEYOPT,ETID,10,TARG_SET_KO10
+    *ENDIF
+
+  *ELSEIF,ENAM,EQ,170,THEN
+    *IF,TARG_SET_KO2,NE,-1,THEN
+      KEYOPT,ETID,2,TARG_SET_KO2
+    *ENDIF
+    *IF,TARG_SET_KO4,NE,-1,THEN
+      KEYOPT,ETID,4,TARG_SET_KO4
+    *ENDIF
+    *IF,TARG_SET_KO10,NE,-1,THEN
+      KEYOPT,ETID,10,TARG_SET_KO10
+    *ENDIF
+
+  ! =========================
+  ! CONTACT FIXES (CONTA171..178)
+  ! =========================
+  *ELSEIF,ENAM,GE,171,AND,ENAM,LE,178,THEN
+
+    ! Read current contact behavior (KEYOPT(12)) from the element TYPE
+    *GET,CUR_KO12,ETYP,ETID,ATTR,KOP12
+
+    *IF,APPLY_ONLY_BONDED,EQ,1,THEN
+      ! Only touch already-bonded contact types (bonded variants)
+      *IF,CUR_KO12,NE,3,THEN
+        *IF,CUR_KO12,NE,5,THEN
+          *IF,CUR_KO12,NE,6,THEN
+            EID = ELNEXT(EID)
+            *CYCLE
+          *ENDIF
+        *ENDIF
+      *ENDIF
+    *ENDIF
+
+    *IF,CONT_SET_KO2,NE,-1,THEN
+      KEYOPT,ETID,2,CONT_SET_KO2
+    *ENDIF
+    *IF,CONT_SET_KO4,NE,-1,THEN
+      KEYOPT,ETID,4,CONT_SET_KO4
+    *ENDIF
+    *IF,CONT_SET_KO12,NE,-1,THEN
+      KEYOPT,ETID,12,CONT_SET_KO12
+    *ENDIF
+
+  *ENDIF
+
+  EID = ELNEXT(EID)
+*ENDDO
+
+ALLSEL,ALL
+FINISH

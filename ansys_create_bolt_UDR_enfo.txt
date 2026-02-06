@@ -1,4 +1,5 @@
 # IronPython script for ANSYS Mechanical (tested syntax style for 2023R2+)
+# --- MODIFIED: multi-folder grouping + optional max/min screening mode ---
 
 import clr
 clr.AddReference("System.Windows.Forms")
@@ -11,6 +12,24 @@ from System.Windows.Forms import (
 from System.Drawing import Point, Size
 
 EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ", "ENMOX", "ENMOY", "ENMOZ"]
+
+# --- NEW: parent folder names ---
+HISTORY_PARENT_SINGLE = "Bolt Results"
+HISTORY_PARENT_MULTI  = "Bolt Results - History Data (Data vs Combination Graphs)"
+SCREEN_PARENT         = "Bolt Results - Max/Min Screening"
+
+# --- NEW: SetDriver mapping for screening results (per user request) ---
+# SetDriver.InternalValue:
+#   3  -> Maximum Over Time
+#   4  -> Time of Maximum
+#   12 -> Minimum Over Time
+#   13 -> Time of Minimum
+SCREEN_SETDRIVERS = [
+    ("Maximum Over Time", 3),
+    ("Time of Maximum",   4),
+    ("Minimum Over Time", 12),
+    ("Time of Minimum",   13),
+]
 
 
 def is_type(obj, type_name):
@@ -152,6 +171,75 @@ def make_unique_name(base_name, used_names):
     return name
 
 
+def _safe_count_ids(ids_obj):
+    if ids_obj is None:
+        return None
+    try:
+        return int(ids_obj.Count)
+    except:
+        pass
+    try:
+        return int(len(ids_obj))
+    except:
+        pass
+    try:
+        return int(len(list(ids_obj)))
+    except:
+        return None
+
+
+# --- NEW: determine if a Named Selection is nodal (mesh nodes) ---
+def _is_nodal_named_selection(ns):
+    st = ""
+    try:
+        st = str(ns.SelectionType)
+    except:
+        st = ""
+
+    if not st:
+        try:
+            st = str(ns.Location.SelectionType)
+        except:
+            st = ""
+
+    st = (st or "").lower()
+    # Handles "MeshNodes", "MeshNode", etc.
+    return ("meshnode" in st) or ("meshnodes" in st)
+
+
+# --- NEW: get node count for nodal Named Selections ---
+def _get_nodal_node_count(ns):
+    try:
+        ids_obj = ns.Location.Ids
+    except:
+        return None
+    return _safe_count_ids(ids_obj)
+
+
+# --- NEW: screening mode trigger: ONLY if all NS are nodal AND each has >1 node ---
+def _should_use_screening_mode(named_selections):
+    if named_selections is None or len(named_selections) == 0:
+        return False
+
+    for ns in named_selections:
+        if not _is_nodal_named_selection(ns):
+            return False
+        cnt = _get_nodal_node_count(ns)
+        if cnt is None or cnt <= 1:
+            return False
+    return True
+
+
+# --- NEW: SetDriver setter helper ---
+def _try_set_setdriver(udr, internal_value):
+    try:
+        prop = udr.PropertyByName("SetDriver")
+        prop.InternalValue = int(internal_value)
+        return True
+    except:
+        return False
+
+
 def run():
     selected_folders = get_selected_grouping_folders()
     if len(selected_folders) == 0:
@@ -168,12 +256,23 @@ def run():
     if target_analysis is None:
         return
 
-    named_selections = []
+    # --- MODIFIED: collect NS per selected input folder (for later subgrouping) ---
+    folder_entries = []  # [{ "folder": obj, "name": str, "named_selections": [ns,...] }, ...]
+    all_named_selections = []
     seen_ids = set()
-    for folder in selected_folders:
-        collect_named_selections_recursive(folder, named_selections, seen_ids)
 
-    if len(named_selections) == 0:
+    for folder in selected_folders:
+        ns_list = []
+        collect_named_selections_recursive(folder, ns_list, seen_ids)
+        folder_entries.append({
+            "folder": folder,
+            "name": getattr(folder, "Name", "Group"),
+            "named_selections": ns_list
+        })
+        for ns in ns_list:
+            all_named_selections.append(ns)
+
+    if len(all_named_selections) == 0:
         MessageBox.Show(
             "No unsuppressed Named Selections were found under the selected grouping folder(s).",
             "Bolt UDR Generator",
@@ -182,44 +281,165 @@ def run():
         )
         return
 
+    # --- NEW: decide mode ---
+    use_screening = _should_use_screening_mode(all_named_selections)
+
     solution = target_analysis.Solution
     tree = ExtAPI.DataModel.Tree
 
-    expr_folders = []
     failed_scopes = []
+    failed_setdrivers = []
     used_names = set()
     created_count = 0
 
+    # --- MODIFIED: parent folder naming logic ---
+    parent_name = None
+    if use_screening:
+        parent_name = SCREEN_PARENT
+    else:
+        parent_name = HISTORY_PARENT_MULTI if len(selected_folders) > 1 else HISTORY_PARENT_SINGLE
+
+    # --- MODIFIED: multi-folder subgrouping only in history mode and only if multiple folders are selected ---
+    multi_input = (len(selected_folders) > 1)
+
     with Transaction():
-        for expr in EXPRESSIONS:
-            expr_results = []
+        expr_folders = []
 
-            for ns in named_selections:
-                udr = solution.AddUserDefinedResult()
-                udr.Expression = expr
-                udr.Name = make_unique_name("{}_{}".format(expr, ns.Name), used_names)
+        if use_screening:
+            # =========================
+            # SCREENING MODE STRUCTURE:
+            #   Bolt Results - Max/Min Screening
+            #     ENFOX
+            #       <NS1>
+            #         (4 UDRs: max, tmax, min, tmin)
+            #       <NS2>
+            #         ...
+            #     ENFOY
+            #       ...
+            # =========================
+            for expr in EXPRESSIONS:
+                ns_group_folders = []
 
-                if not scope_udr_to_named_selection(udr, ns):
-                    failed_scopes.append(udr.Name)
+                for ns in all_named_selections:
+                    ns_udrs = []
 
-                expr_results.append(udr)
-                created_count += 1
+                    for (label, drv_val) in SCREEN_SETDRIVERS:
+                        udr = solution.AddUserDefinedResult()
+                        udr.Expression = expr
 
-            expr_folder = tree.Group(expr_results)
-            expr_folder.Name = expr
-            expr_folders.append(expr_folder)
+                        # Name includes expr + ns + label to keep uniqueness and readability
+                        base = "{}_{}_{}".format(expr, ns.Name, label.replace(" ", ""))
+                        udr.Name = make_unique_name(base, used_names)
 
-        bolt_folder = tree.Group(expr_folders)
-        bolt_folder.Name = "Bolt Results"
+                        if not scope_udr_to_named_selection(udr, ns):
+                            failed_scopes.append(udr.Name)
 
+                        if not _try_set_setdriver(udr, drv_val):
+                            failed_setdrivers.append(udr.Name)
+
+                        ns_udrs.append(udr)
+                        created_count += 1
+
+                    # Group the 4 screening results under a folder named after the NS
+                    ns_folder = tree.Group(ns_udrs)
+                    ns_folder.Name = ns.Name
+                    ns_group_folders.append(ns_folder)
+
+                expr_folder = tree.Group(ns_group_folders)
+                expr_folder.Name = expr
+                expr_folders.append(expr_folder)
+
+            top_folder = tree.Group(expr_folders)
+            top_folder.Name = parent_name
+
+        else:
+            # =========================
+            # HISTORY MODE STRUCTURE:
+            # If 1 input folder:
+            #   Bolt Results
+            #     ENFOX
+            #       UDR per NS
+            #     ...
+            #
+            # If multiple input folders selected:
+            #   Bolt Results - History Data (Data vs Combination Graphs)
+            #     ENFOX
+            #       <InputFolderA>
+            #         UDRs...
+            #       <InputFolderB>
+            #         UDRs...
+            #     ...
+            # =========================
+            for expr in EXPRESSIONS:
+                if multi_input:
+                    # subgroup results by selected input folder
+                    subgroup_folders = []
+                    used_groupnames = set()
+
+                    for fe in folder_entries:
+                        ns_list = fe["named_selections"]
+                        if ns_list is None or len(ns_list) == 0:
+                            continue
+
+                        group_udrs = []
+                        for ns in ns_list:
+                            udr = solution.AddUserDefinedResult()
+                            udr.Expression = expr
+                            udr.Name = make_unique_name("{}_{}".format(expr, ns.Name), used_names)
+
+                            if not scope_udr_to_named_selection(udr, ns):
+                                failed_scopes.append(udr.Name)
+
+                            group_udrs.append(udr)
+                            created_count += 1
+
+                        sub_folder = tree.Group(group_udrs)
+                        sub_folder.Name = make_unique_name(fe["name"], used_groupnames)
+                        subgroup_folders.append(sub_folder)
+
+                    # If (unexpectedly) only one subgroup exists, Group(...) should still work;
+                    # if it doesn't in your environment, the script will fail here and you can
+                    # remove empty/duplicate selected folders to ensure 2+ non-empty subgroups.
+                    expr_folder = tree.Group(subgroup_folders)
+                    expr_folder.Name = expr
+                    expr_folders.append(expr_folder)
+
+                else:
+                    # original behavior: one expr folder containing all UDRs
+                    expr_results = []
+                    for ns in all_named_selections:
+                        udr = solution.AddUserDefinedResult()
+                        udr.Expression = expr
+                        udr.Name = make_unique_name("{}_{}".format(expr, ns.Name), used_names)
+
+                        if not scope_udr_to_named_selection(udr, ns):
+                            failed_scopes.append(udr.Name)
+
+                        expr_results.append(udr)
+                        created_count += 1
+
+                    expr_folder = tree.Group(expr_results)
+                    expr_folder.Name = expr
+                    expr_folders.append(expr_folder)
+
+            top_folder = tree.Group(expr_folders)
+            top_folder.Name = parent_name
+
+    # --- MODIFIED: clearer summary (mode + folder naming) ---
+    mode_txt = "Max/Min Screening" if use_screening else "History Data"
     msg = (
-        "Created {0} User Defined Results in analysis '{1}'.\n"
-        "Named Selections used: {2}\n"
-        "Expression groups: {3}"
-    ).format(created_count, target_analysis.Name, len(named_selections), len(EXPRESSIONS))
+        "Mode: {0}\n"
+        "Created {1} User Defined Results in analysis '{2}'.\n"
+        "Named Selections used: {3}\n"
+        "Expression groups: {4}\n"
+        "Top folder: {5}"
+    ).format(mode_txt, created_count, target_analysis.Name, len(all_named_selections), len(EXPRESSIONS), parent_name)
 
     if len(failed_scopes) > 0:
         msg += "\n\nWarning: {} result(s) could not be scoped automatically.".format(len(failed_scopes))
+
+    if len(failed_setdrivers) > 0:
+        msg += "\n\nWarning: {} screening result(s) could not set SetDriver.".format(len(failed_setdrivers))
 
     MessageBox.Show(msg, "Bolt UDR Generator", MessageBoxButtons.OK, MessageBoxIcon.Information)
 

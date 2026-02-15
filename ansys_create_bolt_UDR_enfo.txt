@@ -95,11 +95,53 @@ def collect_named_selections_recursive(folder, out_list, seen_ids):
             collect_named_selections_recursive(child, out_list, seen_ids)
 
 
-def choose_analysis(analyses):
-    if analyses is None or len(analyses) == 0:
+def get_target_environments():
+    envs = []
+
+    try:
+        analyses = list(Model.Analyses)
+    except:
+        analyses = []
+
+    for ana in analyses:
+        if ana is None:
+            continue
+        envs.append({
+            "obj": ana,
+            "name": getattr(ana, "Name", "Analysis"),
+            "kind": "Analysis"
+        })
+
+    # v232 API supports SolutionCombination as a model child category.
+    sc_list = []
+    try:
+        sc_list = list(Model.GetChildren(DataModelObjectCategory.SolutionCombination, False))
+    except:
+        # Fallback for environments where enum/category lookup fails.
+        try:
+            for child in Model.Children:
+                if is_type(child, "SolutionCombination"):
+                    sc_list.append(child)
+        except:
+            sc_list = []
+
+    for sc in sc_list:
+        if sc is None:
+            continue
+        envs.append({
+            "obj": sc,
+            "name": getattr(sc, "Name", "Solution Combination"),
+            "kind": "Solution Combination"
+        })
+
+    return envs
+
+
+def choose_analysis(analysis_envs):
+    if analysis_envs is None or len(analysis_envs) == 0:
         return None
-    if len(analyses) == 1:
-        return analyses[0]
+    if len(analysis_envs) == 1:
+        return analysis_envs[0]["obj"]
 
     form = Form()
     form.Text = "Select Analysis Environment"
@@ -109,7 +151,7 @@ def choose_analysis(analyses):
     form.MaximizeBox = False
 
     label = Label()
-    label.Text = "Select target analysis for Bolt Results:"
+    label.Text = "Select target environment for Bolt Results:"
     label.Location = Point(12, 12)
     label.AutoSize = True
     form.Controls.Add(label)
@@ -117,8 +159,8 @@ def choose_analysis(analyses):
     listbox = ListBox()
     listbox.Location = Point(12, 38)
     listbox.Size = Size(460, 260)
-    for ana in analyses:
-        listbox.Items.Add(ana.Name)
+    for env in analysis_envs:
+        listbox.Items.Add("[{}] {}".format(env["kind"], env["name"]))
     if listbox.Items.Count > 0:
         listbox.SelectedIndex = 0
     form.Controls.Add(listbox)
@@ -142,7 +184,20 @@ def choose_analysis(analyses):
     if result != DialogResult.OK or listbox.SelectedIndex < 0:
         return None
 
-    return analyses[listbox.SelectedIndex]
+    return analysis_envs[listbox.SelectedIndex]["obj"]
+
+
+def get_solution_container(target_environment):
+    if target_environment is None:
+        return None
+
+    if is_type(target_environment, "SolutionCombination"):
+        return target_environment
+
+    try:
+        return target_environment.Solution
+    except:
+        return None
 
 
 def scope_udr_to_named_selection(udr, ns):
@@ -251,9 +306,18 @@ def run():
         )
         return
 
-    analyses = list(Model.Analyses)
-    target_analysis = choose_analysis(analyses)
-    if target_analysis is None:
+    analysis_envs = get_target_environments()
+    if len(analysis_envs) == 0:
+        MessageBox.Show(
+            "No Analysis or Solution Combination environment is available.",
+            "Bolt UDR Generator",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return
+
+    target_environment = choose_analysis(analysis_envs)
+    if target_environment is None:
         return
 
     # --- MODIFIED: collect NS per selected input folder (for later subgrouping) ---
@@ -284,7 +348,15 @@ def run():
     # --- NEW: decide mode ---
     use_screening = _should_use_screening_mode(all_named_selections)
 
-    solution = target_analysis.Solution
+    solution = get_solution_container(target_environment)
+    if solution is None:
+        MessageBox.Show(
+            "Selected environment has no valid result container.",
+            "Bolt UDR Generator",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return
     tree = ExtAPI.DataModel.Tree
 
     failed_scopes = []
@@ -427,13 +499,24 @@ def run():
 
     # --- MODIFIED: clearer summary (mode + folder naming) ---
     mode_txt = "Max/Min Screening" if use_screening else "History Data"
+    target_env_name = getattr(target_environment, "Name", "Unknown")
+    target_env_kind = "Solution Combination" if is_type(target_environment, "SolutionCombination") else "Analysis"
+
     msg = (
         "Mode: {0}\n"
-        "Created {1} User Defined Results in analysis '{2}'.\n"
-        "Named Selections used: {3}\n"
-        "Expression groups: {4}\n"
-        "Top folder: {5}"
-    ).format(mode_txt, created_count, target_analysis.Name, len(all_named_selections), len(EXPRESSIONS), parent_name)
+        "Created {1} User Defined Results in {2} '{3}'.\n"
+        "Named Selections used: {4}\n"
+        "Expression groups: {5}\n"
+        "Top folder: {6}"
+    ).format(
+        mode_txt,
+        created_count,
+        target_env_kind,
+        target_env_name,
+        len(all_named_selections),
+        len(EXPRESSIONS),
+        parent_name
+    )
 
     if len(failed_scopes) > 0:
         msg += "\n\nWarning: {} result(s) could not be scoped automatically.".format(len(failed_scopes))

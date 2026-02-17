@@ -1,0 +1,1089 @@
+﻿
+import clr
+import math
+import units
+
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+
+from System.Windows.Forms import (
+    Form, Label, TextBox, ComboBox, ComboBoxStyle, CheckBox, Button, ToolTip,
+    DialogResult, MessageBox, MessageBoxButtons, MessageBoxIcon,
+    FormStartPosition, DataGridView, DataGridViewTextBoxColumn,
+    DataGridViewComboBoxColumn, DataGridViewAutoSizeColumnsMode,
+    DataGridViewEditMode, DataGridViewDataErrorContexts
+)
+from System.Drawing import Point, Size
+
+APP_TITLE = "Ordered Connected Element CS + Bolt Pretension"
+
+CS_MODE_CYL = "Cylindrical"
+CS_MODE_CART = "Cartesian"
+AXIS_LABELS = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
+
+COORD_TYPE_CART = 0
+ANALYSIS_TYPE_STATIC = 0
+ANALYSIS_TYPE_TRANSIENT = 2
+BOLT_DEFINE_BY_LOAD = 0
+BOLT_DEFINE_BY_LOCK = 2
+
+AXIS_VALUE_BY_LABEL = {
+    "+X": 1, "+Y": 2, "+Z": 3,
+    "-X": 4, "-Y": 5, "-Z": 6
+}
+AXIS_VEC_BY_LABEL = {
+    "+X": [1.0, 0.0, 0.0],
+    "-X": [-1.0, 0.0, 0.0],
+    "+Y": [0.0, 1.0, 0.0],
+    "-Y": [0.0, -1.0, 0.0],
+    "+Z": [0.0, 0.0, 1.0],
+    "-Z": [0.0, 0.0, -1.0]
+}
+NEAR_AXIS_TOL_M = 1e-6
+
+
+def dot(a, b):
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+
+def cross(a, b):
+    return [
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0]
+    ]
+
+
+def norm(v):
+    return math.sqrt(dot(v, v))
+
+
+def normalize(v):
+    n = norm(v)
+    if n <= 0.0:
+        raise Exception("Zero-length vector.")
+    return [v[0]/n, v[1]/n, v[2]/n]
+
+
+def to_float(txt):
+    return float(str(txt).strip().replace(",", "."))
+
+
+def mesh_elements_sel_type():
+    try:
+        return SelectionTypeEnum.MeshElements
+    except:
+        return 2
+
+
+def is_elemental_selection(loc):
+    if loc is None:
+        return False
+    try:
+        return loc.SelectionType == SelectionTypeEnum.MeshElements
+    except:
+        try:
+            return int(loc.SelectionType) == 2
+        except:
+            return False
+
+
+def convert_length(value, from_unit, to_unit):
+    try:
+        return float(units.ConvertUnit(value, from_unit, to_unit, "Length"))
+    except:
+        return float(value)
+
+
+def get_axis_base(label):
+    return str(label)[-1].upper()
+
+
+def reference_options_for_axis(axis_label):
+    b = get_axis_base(axis_label)
+    if b == "X":
+        return ["+Y", "-Y", "+Z", "-Z"]
+    if b == "Y":
+        return ["+X", "-X", "+Z", "-Z"]
+    return ["+X", "-X", "+Y", "-Y"]
+
+
+def get_active_element_ns():
+    active = ExtAPI.DataModel.Tree.ActiveObjects
+    if active is None or len(active) != 1:
+        MessageBox.Show(
+            "Please select exactly one elemental Named Selection (Mesh Elements).",
+            APP_TITLE,
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return None, None
+
+    obj = active[0]
+    if obj.GetType().Name != "NamedSelection":
+        MessageBox.Show(
+            "Selected object is not a Named Selection.",
+            APP_TITLE,
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return None, None
+
+    try:
+        obj.Generate()
+    except:
+        pass
+
+    loc = obj.Location
+    if not is_elemental_selection(loc):
+        MessageBox.Show(
+            "Selected Named Selection must be elemental (Mesh Elements).",
+            APP_TITLE,
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return None, None
+
+    try:
+        element_ids = [int(i) for i in loc.Ids]
+    except:
+        element_ids = []
+
+    if len(element_ids) == 0:
+        MessageBox.Show(
+            "Selected elemental Named Selection has no mesh elements.",
+            APP_TITLE,
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+        )
+        return None, None
+
+    return obj, element_ids
+
+def _analysis_type_label(analysis):
+    try:
+        at = analysis.AnalysisType
+        t = str(at)
+        if t:
+            return t
+    except:
+        pass
+    return "Unknown"
+
+
+def _analysis_display_name(analysis):
+    try:
+        n = str(analysis.InternalObject.DisplayName)
+        if n:
+            return n
+    except:
+        pass
+    try:
+        n = str(analysis.Name)
+        if n:
+            return n
+    except:
+        pass
+    return "Analysis_{0}".format(analysis.ObjectId)
+
+
+def _is_static_or_transient(analysis):
+    try:
+        at = analysis.AnalysisType
+    except:
+        return False
+
+    try:
+        if at == AnalysisType.Static or at == AnalysisType.Transient:
+            return True
+    except:
+        pass
+
+    try:
+        iv = int(at)
+        if iv == ANALYSIS_TYPE_STATIC or iv == ANALYSIS_TYPE_TRANSIENT:
+            return True
+    except:
+        pass
+
+    s = str(at).lower()
+    return ("static" in s) or ("transient" in s)
+
+
+def get_supported_analyses():
+    analyses = []
+    labels = []
+
+    try:
+        candidates = list(ExtAPI.DataModel.AnalysisList)
+    except:
+        try:
+            candidates = list(Model.Analyses)
+        except:
+            candidates = []
+
+    for analysis in candidates:
+        if not _is_static_or_transient(analysis):
+            continue
+        analyses.append(analysis)
+        labels.append("{0} [{1}]".format(_analysis_display_name(analysis), _analysis_type_label(analysis)))
+
+    return analyses, labels
+
+
+def get_analysis_step_count(analysis):
+    try:
+        c = int(analysis.StepsEndTime.Count)
+        if c > 0:
+            return c
+    except:
+        pass
+
+    try:
+        c = len(list(analysis.StepsEndTime))
+        if c > 0:
+            return c
+    except:
+        pass
+
+    try:
+        c = int(analysis.AnalysisSettings.NumberOfSteps)
+        if c > 0:
+            return c
+    except:
+        pass
+
+    try:
+        c = int(analysis.AnalysisSettings.InternalObject.NumberOfSteps)
+        if c > 0:
+            return c
+    except:
+        pass
+
+    return 0
+
+
+def show_input_form(analysis_labels):
+    form = Form()
+    form.Text = "Ordered Connected Element CS + Bolt Pretension Input"
+    form.StartPosition = FormStartPosition.CenterScreen
+    form.Size = Size(560, 490)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+
+    tip = ToolTip()
+    tip.AutoPopDelay = 12000
+    tip.InitialDelay = 250
+    tip.ReshowDelay = 100
+    tip.ShowAlways = True
+
+    def cb_text(cb, default_text=""):
+        try:
+            t = str(cb.SelectedItem)
+            if t and t != "None":
+                return t
+        except:
+            pass
+        return default_text
+
+    y = 18
+
+    lbl_analysis = Label()
+    lbl_analysis.Text = "Target Analysis (Static/Transient):"
+    lbl_analysis.Location = Point(12, y)
+    lbl_analysis.AutoSize = True
+    form.Controls.Add(lbl_analysis)
+
+    cb_analysis = ComboBox()
+    cb_analysis.DropDownStyle = ComboBoxStyle.DropDownList
+    cb_analysis.Location = Point(290, y - 3)
+    cb_analysis.Size = Size(250, 21)
+    for s in analysis_labels:
+        cb_analysis.Items.Add(s)
+    cb_analysis.SelectedIndex = 0
+    form.Controls.Add(cb_analysis)
+    tip.SetToolTip(cb_analysis, "Bolt pretension objects will be created in this analysis environment.")
+
+    y += 38
+
+    lbl_mode = Label()
+    lbl_mode.Text = "Ordering Type:"
+    lbl_mode.Location = Point(12, y)
+    lbl_mode.AutoSize = True
+    form.Controls.Add(lbl_mode)
+
+    cb_mode = ComboBox()
+    cb_mode.DropDownStyle = ComboBoxStyle.DropDownList
+    cb_mode.Location = Point(290, y - 3)
+    cb_mode.Size = Size(250, 21)
+    cb_mode.Items.Add(CS_MODE_CYL)
+    cb_mode.Items.Add(CS_MODE_CART)
+    cb_mode.SelectedIndex = 0
+    form.Controls.Add(cb_mode)
+    tip.SetToolTip(cb_mode, "Cylindrical: sort by angle. Cartesian: sort along local +X. Created CS objects are always Cartesian.")
+
+    y += 38
+
+    lbl_x = Label()
+    lbl_x.Text = "Ordering Origin X [mm]:"
+    lbl_x.Location = Point(12, y)
+    lbl_x.AutoSize = True
+    form.Controls.Add(lbl_x)
+
+    tb_x = TextBox()
+    tb_x.Text = "0"
+    tb_x.Location = Point(290, y - 3)
+    tb_x.Size = Size(250, 20)
+    form.Controls.Add(tb_x)
+
+    y += 34
+
+    lbl_y = Label()
+    lbl_y.Text = "Ordering Origin Y [mm]:"
+    lbl_y.Location = Point(12, y)
+    lbl_y.AutoSize = True
+    form.Controls.Add(lbl_y)
+
+    tb_y = TextBox()
+    tb_y.Text = "0"
+    tb_y.Location = Point(290, y - 3)
+    tb_y.Size = Size(250, 20)
+    form.Controls.Add(tb_y)
+
+    y += 34
+
+    lbl_z = Label()
+    lbl_z.Text = "Ordering Origin Z [mm]:"
+    lbl_z.Location = Point(12, y)
+    lbl_z.AutoSize = True
+    form.Controls.Add(lbl_z)
+
+    tb_z = TextBox()
+    tb_z.Text = "0"
+    tb_z.Location = Point(290, y - 3)
+    tb_z.Size = Size(250, 20)
+    form.Controls.Add(tb_z)
+
+    y += 34
+
+    lbl_axis = Label()
+    lbl_axis.Text = "Axis / +X direction:"
+    lbl_axis.Location = Point(12, y)
+    lbl_axis.AutoSize = True
+    form.Controls.Add(lbl_axis)
+
+    cb_axis = ComboBox()
+    cb_axis.DropDownStyle = ComboBoxStyle.DropDownList
+    cb_axis.Location = Point(290, y - 3)
+    cb_axis.Size = Size(250, 21)
+    for a in AXIS_LABELS:
+        cb_axis.Items.Add(a)
+    cb_axis.SelectedIndex = 4
+    form.Controls.Add(cb_axis)
+
+    y += 34
+
+    lbl_ref = Label()
+    lbl_ref.Text = "0 deg reference direction:"
+    lbl_ref.Location = Point(12, y)
+    lbl_ref.AutoSize = True
+    form.Controls.Add(lbl_ref)
+
+    cb_ref = ComboBox()
+    cb_ref.DropDownStyle = ComboBoxStyle.DropDownList
+    cb_ref.Location = Point(290, y - 3)
+    cb_ref.Size = Size(250, 21)
+    form.Controls.Add(cb_ref)
+
+    y += 34
+
+    chk_reverse = CheckBox()
+    chk_reverse.Text = "Reverse ordering"
+    chk_reverse.Location = Point(290, y - 3)
+    chk_reverse.AutoSize = True
+    form.Controls.Add(chk_reverse)
+
+    y += 34
+
+    lbl_preview = Label()
+    lbl_preview.Location = Point(12, y)
+    lbl_preview.Size = Size(528, 66)
+    lbl_preview.AutoSize = False
+    form.Controls.Add(lbl_preview)
+
+    y += 78
+
+    btn_ok = Button()
+    btn_ok.Text = "OK"
+    btn_ok.Location = Point(376, y)
+    btn_ok.DialogResult = DialogResult.OK
+    form.Controls.Add(btn_ok)
+
+    btn_cancel = Button()
+    btn_cancel.Text = "Cancel"
+    btn_cancel.Location = Point(457, y)
+    btn_cancel.DialogResult = DialogResult.Cancel
+    form.Controls.Add(btn_cancel)
+
+    form.AcceptButton = btn_ok
+    form.CancelButton = btn_cancel
+
+    def refresh_ref_options(*args):
+        current = cb_text(cb_ref)
+        cb_ref.Items.Clear()
+        opts = reference_options_for_axis(cb_text(cb_axis, "+Z"))
+        for opt in opts:
+            cb_ref.Items.Add(opt)
+        if current in opts:
+            cb_ref.SelectedItem = current
+        else:
+            cb_ref.SelectedIndex = 0
+
+    def refresh_mode_ui(*args):
+        is_cyl = (cb_text(cb_mode, CS_MODE_CYL) == CS_MODE_CYL)
+        cb_ref.Enabled = is_cyl
+        lbl_ref.Enabled = is_cyl
+
+    def update_preview(*args):
+        mode = cb_text(cb_mode, CS_MODE_CYL)
+        axis = cb_text(cb_axis, "+Z")
+        refd = cb_text(cb_ref, "-Y")
+        rev = bool(chk_reverse.Checked)
+
+        if mode == CS_MODE_CYL:
+            order_txt = "counterclockwise" if rev else "clockwise"
+            lbl_preview.Text = (
+                "Preview: Cylindrical\n"
+                "Group centers are sorted by angle around the ordering origin.\n"
+                "View from {0} tip toward origin. 0 deg starts at {1}; order is {2}."
+            ).format(axis, refd, order_txt)
+        else:
+            direction = "largest to smallest" if rev else "smallest to largest"
+            lbl_preview.Text = (
+                "Preview: Cartesian\n"
+                "Local +X is along {0}. Group centers are ordered by local X from {1}."
+            ).format(axis, direction)
+
+    cb_axis.SelectedIndexChanged += refresh_ref_options
+    cb_axis.SelectedIndexChanged += update_preview
+    cb_mode.SelectedIndexChanged += refresh_mode_ui
+    cb_mode.SelectedIndexChanged += update_preview
+    cb_ref.SelectedIndexChanged += update_preview
+    chk_reverse.CheckedChanged += update_preview
+
+    refresh_ref_options()
+    refresh_mode_ui()
+    update_preview()
+
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+
+    try:
+        analysis_idx = int(cb_analysis.SelectedIndex)
+        mode = cb_text(cb_mode)
+        ox = to_float(tb_x.Text)
+        oy = to_float(tb_y.Text)
+        oz = to_float(tb_z.Text)
+        axis_label = cb_text(cb_axis)
+        ref_label = cb_text(cb_ref)
+        reverse = bool(chk_reverse.Checked)
+    except:
+        MessageBox.Show("Invalid input values.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        return None
+
+    return analysis_idx, mode, ox, oy, oz, axis_label, ref_label, reverse
+
+def show_bolt_step_table(step_count):
+    form = Form()
+    form.Text = "Bolt Pretension Tabular Data"
+    form.StartPosition = FormStartPosition.CenterScreen
+    form.Size = Size(430, 470)
+    form.MinimizeBox = False
+    form.MaximizeBox = False
+
+    lbl_info = Label()
+    lbl_info.Text = "Define By options: Load / Lock. Step 1 must be Load."
+    lbl_info.Location = Point(12, 10)
+    lbl_info.Size = Size(400, 20)
+    form.Controls.Add(lbl_info)
+
+    grid = DataGridView()
+    grid.Location = Point(12, 34)
+    grid.Size = Size(390, 360)
+    grid.AllowUserToAddRows = False
+    grid.AllowUserToDeleteRows = False
+    grid.RowHeadersVisible = False
+    grid.EditMode = DataGridViewEditMode.EditOnEnter
+    grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+    form.Controls.Add(grid)
+
+    col_step = DataGridViewTextBoxColumn()
+    col_step.HeaderText = "Steps"
+    col_step.Name = "Steps"
+    col_step.ReadOnly = True
+    grid.Columns.Add(col_step)
+
+    col_define = DataGridViewComboBoxColumn()
+    col_define.HeaderText = "Define By"
+    col_define.Name = "DefineBy"
+    col_define.Items.Add("Load")
+    col_define.Items.Add("Lock")
+    grid.Columns.Add(col_define)
+
+    col_preload = DataGridViewTextBoxColumn()
+    col_preload.HeaderText = "Preload [N]"
+    col_preload.Name = "Preload"
+    grid.Columns.Add(col_preload)
+
+    for i in range(step_count):
+        idx = grid.Rows.Add()
+        row = grid.Rows[idx]
+        row.Cells[0].Value = "{0}.".format(i + 1)
+        row.Cells[1].Value = "Load"
+        row.Cells[2].Value = "0"
+
+    def update_row_preload(row_index):
+        if row_index < 0 or row_index >= grid.Rows.Count:
+            return
+
+        row = grid.Rows[row_index]
+        define_by = str(row.Cells[1].Value)
+        preload_cell = row.Cells[2]
+
+        if row_index == 0 and define_by == "Lock":
+            row.Cells[1].Value = "Load"
+            define_by = "Load"
+
+        if define_by == "Lock":
+            preload_cell.Value = "N/A"
+            preload_cell.ReadOnly = True
+        else:
+            txt = str(preload_cell.Value).strip() if preload_cell.Value is not None else ""
+            if (txt == "") or (txt.upper() == "N/A"):
+                preload_cell.Value = "0"
+            preload_cell.ReadOnly = False
+
+    def on_current_cell_dirty_state_changed(sender, args):
+        try:
+            if grid.IsCurrentCellDirty:
+                grid.CommitEdit(DataGridViewDataErrorContexts.Commit)
+        except:
+            pass
+
+    def on_cell_value_changed(sender, args):
+        try:
+            if args.RowIndex >= 0 and args.ColumnIndex == 1:
+                update_row_preload(args.RowIndex)
+        except:
+            pass
+
+    def on_data_error(sender, args):
+        try:
+            args.ThrowException = False
+        except:
+            pass
+
+    grid.CurrentCellDirtyStateChanged += on_current_cell_dirty_state_changed
+    grid.CellValueChanged += on_cell_value_changed
+    grid.DataError += on_data_error
+
+    btn_ok = Button()
+    btn_ok.Text = "OK"
+    btn_ok.Location = Point(238, 404)
+    btn_ok.DialogResult = DialogResult.OK
+    form.Controls.Add(btn_ok)
+
+    btn_cancel = Button()
+    btn_cancel.Text = "Cancel"
+    btn_cancel.Location = Point(321, 404)
+    btn_cancel.DialogResult = DialogResult.Cancel
+    form.Controls.Add(btn_cancel)
+
+    form.AcceptButton = btn_ok
+    form.CancelButton = btn_cancel
+
+    if form.ShowDialog() != DialogResult.OK:
+        return None
+
+    rows = []
+    for i in range(step_count):
+        row = grid.Rows[i]
+        define_by = str(row.Cells[1].Value)
+
+        if i == 0 and define_by == "Lock":
+            MessageBox.Show("Step 1 cannot be Lock. Use Load at Step 1.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return None
+
+        if define_by == "Load":
+            try:
+                preload = to_float(row.Cells[2].Value)
+            except:
+                MessageBox.Show("Invalid preload value at step {0}.".format(i + 1), APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                return None
+            rows.append(("Load", preload))
+        else:
+            rows.append(("Lock", None))
+
+    return rows
+
+
+def create_local_cs(cs_name, ox_mm, oy_mm, oz_mm, axis_label):
+    cs = Model.CoordinateSystems.AddCoordinateSystem()
+    cs.Name = cs_name
+
+    cs.OriginX = Quantity("{0} [mm]".format(ox_mm))
+    cs.OriginY = Quantity("{0} [mm]".format(oy_mm))
+    cs.OriginZ = Quantity("{0} [mm]".format(oz_mm))
+
+    try:
+        cs.CoordinateSystemType = CoordinateSystemTypeEnum.Cartesian
+    except:
+        cs.CoordinateSystemType = COORD_TYPE_CART
+
+    axis_val = AXIS_VALUE_BY_LABEL[axis_label]
+    try:
+        cs.PrimaryAxis = axis_val
+    except:
+        pass
+
+    return cs
+
+
+def create_element_named_selection(ns_name, element_ids):
+    ns = Model.NamedSelections.AddNamedSelection()
+    sel = ExtAPI.SelectionManager.CreateSelectionInfo(mesh_elements_sel_type())
+    sel.Ids = list(element_ids)
+    ns.Location = sel
+    ns.Name = ns_name
+    return ns
+
+
+def get_node_xyz(node_obj):
+    try:
+        return float(node_obj.X), float(node_obj.Y), float(node_obj.Z)
+    except:
+        c = node_obj.Coordinates
+        return float(c[0]), float(c[1]), float(c[2])
+
+
+def build_basis_cyl(axis_vec, ref_vec):
+    ez = normalize(axis_vec)
+
+    ex_proj = [
+        ref_vec[0] - dot(ref_vec, ez)*ez[0],
+        ref_vec[1] - dot(ref_vec, ez)*ez[1],
+        ref_vec[2] - dot(ref_vec, ez)*ez[2]
+    ]
+
+    if norm(ex_proj) <= 1e-12:
+        raise Exception("Reference direction is parallel to axis.")
+
+    ex = normalize(ex_proj)
+    ey = normalize(cross(ez, ex))
+    return ex, ey, ez
+
+
+def build_basis_cart(x_dir):
+    ex = normalize(x_dir)
+    ref = [0.0, 0.0, 1.0]
+    if abs(dot(ex, ref)) > 0.95:
+        ref = [0.0, 1.0, 0.0]
+    ey = normalize(cross(ref, ex))
+    ez = normalize(cross(ex, ey))
+    return ex, ey, ez
+
+def get_element_node_ids(elem_obj):
+    try:
+        return [int(i) for i in elem_obj.NodeIds]
+    except:
+        return []
+
+
+def build_connected_element_groups(mesh, element_ids):
+    element_to_nodes = {}
+    node_to_elements = {}
+    skipped_missing_elements = []
+
+    for eid in element_ids:
+        try:
+            elem = mesh.ElementById(eid)
+        except:
+            elem = None
+
+        if elem is None:
+            skipped_missing_elements.append(eid)
+            continue
+
+        node_ids = get_element_node_ids(elem)
+        if len(node_ids) == 0:
+            skipped_missing_elements.append(eid)
+            continue
+
+        element_to_nodes[eid] = node_ids
+        for nid in node_ids:
+            if nid in node_to_elements:
+                node_to_elements[nid].append(eid)
+            else:
+                node_to_elements[nid] = [eid]
+
+    groups = []
+    visited = set()
+
+    for seed in sorted(element_to_nodes.keys()):
+        if seed in visited:
+            continue
+
+        visited.add(seed)
+        stack = [seed]
+        comp = []
+
+        while len(stack) > 0:
+            cur = stack.pop()
+            comp.append(cur)
+
+            for nid in element_to_nodes[cur]:
+                neighbors = node_to_elements.get(nid, [])
+                for nb in neighbors:
+                    if nb not in visited:
+                        visited.add(nb)
+                        stack.append(nb)
+
+        comp.sort()
+        groups.append(comp)
+
+    groups.sort(key=lambda g: g[0])
+    return groups, element_to_nodes, skipped_missing_elements
+
+
+def get_group_center(mesh, group_element_ids, element_to_nodes, node_xyz_cache):
+    sx = 0.0
+    sy = 0.0
+    sz = 0.0
+    n_elem_centroids = 0
+    missing_node_lookups = 0
+
+    for eid in group_element_ids:
+        node_ids = element_to_nodes.get(eid, [])
+        if len(node_ids) == 0:
+            continue
+
+        ex = 0.0
+        ey = 0.0
+        ez = 0.0
+        n_nodes = 0
+
+        for nid in node_ids:
+            if nid in node_xyz_cache:
+                nx, ny, nz = node_xyz_cache[nid]
+            else:
+                try:
+                    node = mesh.NodeById(nid)
+                except:
+                    node = None
+
+                if node is None:
+                    missing_node_lookups += 1
+                    continue
+
+                nx, ny, nz = get_node_xyz(node)
+                node_xyz_cache[nid] = (nx, ny, nz)
+
+            ex += nx
+            ey += ny
+            ez += nz
+            n_nodes += 1
+
+        if n_nodes > 0:
+            sx += ex / n_nodes
+            sy += ey / n_nodes
+            sz += ez / n_nodes
+            n_elem_centroids += 1
+
+    if n_elem_centroids == 0:
+        raise Exception("Could not compute group center.")
+
+    return sx / n_elem_centroids, sy / n_elem_centroids, sz / n_elem_centroids, missing_node_lookups
+
+
+def _bolt_define_by_value(label):
+    if label == "Load":
+        try:
+            return BoltLoadDefineBy.Load
+        except:
+            return BOLT_DEFINE_BY_LOAD
+    try:
+        return BoltLoadDefineBy.Lock
+    except:
+        return BOLT_DEFINE_BY_LOCK
+
+
+def _set_bolt_preload_value(bolt, step_index_zero_based, preload_value):
+    output = bolt.Preload.Output
+    unit = str(output.Unit)
+    q = Quantity("{0} [{1}]".format(preload_value, unit))
+
+    try:
+        output.SetDiscreteValue(step_index_zero_based, q)
+        return
+    except:
+        pass
+
+    try:
+        output.DiscreteValues[step_index_zero_based] = q
+    except:
+        raise Exception("Failed to set preload value at step index {0}.".format(step_index_zero_based))
+
+
+def apply_step_table_to_bolt(bolt, step_table):
+    for i, row in enumerate(step_table):
+        define_by = row[0]
+        preload = row[1]
+        step_num = i + 1
+
+        bolt.SetDefineBy(step_num, _bolt_define_by_value(define_by))
+        if define_by == "Load":
+            _set_bolt_preload_value(bolt, i, preload)
+
+def main():
+    source_ns, element_ids = get_active_element_ns()
+    if source_ns is None:
+        return
+
+    analyses, analysis_labels = get_supported_analyses()
+    if len(analyses) == 0:
+        MessageBox.Show("No Static/Transient analysis environment found in this model.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        return
+
+    if len(element_ids) > 5000:
+        ans = MessageBox.Show(
+            "Selected NS contains {0} elements.\nThis may take time.\n\nContinue?".format(len(element_ids)),
+            APP_TITLE,
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning
+        )
+        if ans != DialogResult.Yes:
+            return
+
+    user = show_input_form(analysis_labels)
+    if user is None:
+        return
+
+    analysis_idx, mode, ox_mm, oy_mm, oz_mm, axis_label, ref_label, reverse = user
+    if analysis_idx < 0 or analysis_idx >= len(analyses):
+        MessageBox.Show("Invalid analysis selection.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        return
+
+    target_analysis = analyses[analysis_idx]
+    target_analysis_name = _analysis_display_name(target_analysis)
+    step_count = get_analysis_step_count(target_analysis)
+    if step_count <= 0:
+        MessageBox.Show("Selected analysis has no load steps.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        return
+
+    axis_vec = AXIS_VEC_BY_LABEL[axis_label]
+    ref_vec = AXIS_VEC_BY_LABEL[ref_label]
+
+    mesh = DataModel.MeshDataByName("Global")
+    if mesh is None:
+        MessageBox.Show("Could not access mesh data via DataModel.MeshDataByName('Global').", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        return
+
+    groups, element_to_nodes, skipped_missing_elements = build_connected_element_groups(mesh, element_ids)
+    if len(groups) == 0:
+        MessageBox.Show("No valid connected element groups were found in the selected NS.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        return
+
+    lu = DataModel.CurrentConsistentUnitFromQuantityName("Length")
+    origin = [
+        convert_length(ox_mm, "mm", lu),
+        convert_length(oy_mm, "mm", lu),
+        convert_length(oz_mm, "mm", lu)
+    ]
+    near_axis_tol = convert_length(NEAR_AXIS_TOL_M, "m", lu)
+
+    try:
+        if mode == CS_MODE_CYL:
+            ex, ey, ez = build_basis_cyl(axis_vec, ref_vec)
+        else:
+            ex, ey, ez = build_basis_cart(axis_vec)
+    except Exception as exn:
+        MessageBox.Show("Failed to define local basis:\n{0}".format(str(exn)), APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Error)
+        return
+
+    sortable = []
+    skipped_near_axis = []
+    skipped_no_center = []
+    node_xyz_cache = {}
+    missing_node_lookups = 0
+
+    for group in groups:
+        try:
+            px, py, pz, miss_count = get_group_center(mesh, group, element_to_nodes, node_xyz_cache)
+            missing_node_lookups += miss_count
+        except:
+            skipped_no_center.append(group[0])
+            continue
+
+        vx = px - origin[0]
+        vy = py - origin[1]
+        vz = pz - origin[2]
+
+        lx = vx*ex[0] + vy*ex[1] + vz*ex[2]
+        ly = vx*ey[0] + vy*ey[1] + vz*ey[2]
+        lz = vx*ez[0] + vy*ez[1] + vz*ez[2]
+
+        if mode == CS_MODE_CYL:
+            r = math.sqrt(lx*lx + ly*ly)
+            if r <= near_axis_tol:
+                skipped_near_axis.append(group[0])
+                continue
+
+            theta_ccw = math.degrees(math.atan2(ly, lx))
+            if theta_ccw < 0.0:
+                theta_ccw += 360.0
+            theta_cw = (360.0 - theta_ccw) % 360.0
+
+            angle_key = theta_ccw if reverse else theta_cw
+            sortable.append((angle_key, r, group[0], group, (px, py, pz)))
+        else:
+            radial_yz = math.sqrt(ly*ly + lz*lz)
+            x_key = -lx if reverse else lx
+            sortable.append((x_key, radial_yz, group[0], group, (px, py, pz)))
+
+    if len(sortable) == 0:
+        MessageBox.Show("No connected element groups available to create ordered coordinate systems.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
+        return
+
+    sortable.sort(key=lambda t: (t[0], t[1], t[2]))
+
+    created_cs = []
+    created_group_ns = []
+    created_bolts = []
+    failed_bolt_groups = []
+    cs_folder = None
+    ns_folder = None
+    bolt_folder = None
+
+    width = max(3, len(str(len(sortable))))
+
+    with Transaction():
+        for i, item in enumerate(sortable):
+            group = item[3]
+            px, py, pz = item[4]
+            px_mm = convert_length(px, lu, "mm")
+            py_mm = convert_length(py, lu, "mm")
+            pz_mm = convert_length(pz, lu, "mm")
+            idx_txt = str(i + 1).zfill(width)
+
+            cs = create_local_cs("CS_ConnElem_{0}".format(idx_txt), px_mm, py_mm, pz_mm, axis_label)
+            created_cs.append(cs)
+
+            ns = create_element_named_selection("NS_ConnElem_{0}".format(idx_txt), group)
+            created_group_ns.append(ns)
+
+            try:
+                bolt = target_analysis.AddBoltPretension()
+                bolt.Name = "BoltPretension_{0}".format(idx_txt)
+
+                try:
+                    bolt.Location = ns.Location
+                except:
+                    try:
+                        bolt.Location = ns
+                    except:
+                        sel = ExtAPI.SelectionManager.CreateSelectionInfo(mesh_elements_sel_type())
+                        sel.Ids = list(group)
+                        bolt.Location = sel
+
+                try:
+                    bolt.CoordinateSystem = cs
+                except:
+                    pass
+
+                created_bolts.append(bolt)
+            except:
+                failed_bolt_groups.append(group[0])
+
+        if len(created_cs) > 0:
+            try:
+                cs_folder = Model.AddTreeGroupingFolder(created_cs)
+                cs_folder.Name = "OrderedConnElemCS_{0}".format(source_ns.Name)
+            except:
+                cs_folder = None
+
+        if len(created_group_ns) > 0:
+            try:
+                ns_folder = Model.AddTreeGroupingFolder(created_group_ns)
+                ns_folder.Name = "OrderedConnElemNS_{0}".format(source_ns.Name)
+            except:
+                ns_folder = None
+
+        if len(created_bolts) > 0:
+            try:
+                bolt_folder = Model.AddTreeGroupingFolder(created_bolts)
+                bolt_folder.Name = "OrderedBoltPretension_{0}".format(source_ns.Name)
+            except:
+                bolt_folder = None
+
+    table_applied = False
+    table_canceled = False
+    preload_apply_failures = 0
+
+    if len(created_bolts) > 0:
+        step_table = show_bolt_step_table(step_count)
+        if step_table is None:
+            table_canceled = True
+        else:
+            with Transaction():
+                for bolt in created_bolts:
+                    try:
+                        apply_step_table_to_bolt(bolt, step_table)
+                    except:
+                        preload_apply_failures += 1
+            table_applied = (preload_apply_failures == 0)
+
+    lines = []
+    lines.append("Ordering mode: {0}".format(mode))
+    lines.append("Order: {0}".format("Reversed" if reverse else "Normal"))
+    lines.append("Source NS: {0}".format(source_ns.Name))
+    lines.append("Target analysis: {0}".format(target_analysis_name))
+    lines.append("Load steps in target analysis: {0}".format(step_count))
+    lines.append("Ordering origin [mm]: ({0}, {1}, {2})".format(ox_mm, oy_mm, oz_mm))
+    lines.append("Input element count: {0}".format(len(element_ids)))
+    lines.append("Connected groups found: {0}".format(len(groups)))
+    lines.append("Created ordered CS count: {0}".format(len(created_cs)))
+    lines.append("Created connected-group NS count: {0}".format(len(created_group_ns)))
+    lines.append("Created ordered bolt pretension count: {0}".format(len(created_bolts)))
+
+    if cs_folder is not None:
+        lines.append("CS folder: {0}".format(cs_folder.Name))
+    if ns_folder is not None:
+        lines.append("Group NS folder: {0}".format(ns_folder.Name))
+    if bolt_folder is not None:
+        lines.append("Bolt folder: {0}".format(bolt_folder.Name))
+    if mode == CS_MODE_CYL:
+        lines.append("0-degree reference: {0}".format(ref_label))
+    if mode == CS_MODE_CYL and len(skipped_near_axis) > 0:
+        lines.append("Skipped near-axis groups (<1e-6 m): {0}".format(len(skipped_near_axis)))
+    if len(skipped_no_center) > 0:
+        lines.append("Skipped groups with incomplete node data: {0}".format(len(skipped_no_center)))
+    if len(skipped_missing_elements) > 0:
+        lines.append("Skipped invalid/missing elements: {0}".format(len(skipped_missing_elements)))
+    if missing_node_lookups > 0:
+        lines.append("Missing node lookups while centering: {0}".format(missing_node_lookups))
+    if len(failed_bolt_groups) > 0:
+        lines.append("Groups where bolt pretension creation failed: {0}".format(len(failed_bolt_groups)))
+
+    if len(created_bolts) == 0:
+        lines.append("Bolt tabular data: not opened (no bolt objects created).")
+    elif table_canceled:
+        lines.append("Bolt tabular data: canceled by user; bolt step data unchanged.")
+    elif table_applied:
+        lines.append("Bolt tabular data: applied to all created bolt pretension objects.")
+    else:
+        lines.append("Bolt tabular data: applied with failures on {0} bolt objects.".format(preload_apply_failures))
+
+    MessageBox.Show("\n".join(lines), APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Information)
+
+
+main()

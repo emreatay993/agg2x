@@ -95,58 +95,6 @@ def convert_length(value, from_unit, to_unit):
         return float(value)
 
 
-def convert_force(value, from_unit, to_unit):
-    try:
-        return float(units.ConvertUnit(value, from_unit, to_unit, "Force"))
-    except:
-        return float(value)
-
-
-def set_units_to_nmm():
-    """
-    Force Mechanical unit system to N-mm (StandardNMM) via API.
-    Returns True when at least one API path succeeds.
-    """
-    ok = False
-
-    # Project-level unit system (documented in ACT API).
-    try:
-        ExtAPI.DataModel.Project.UnitSystem = WBUnitSystemType.StandardNMM
-        ok = True
-    except:
-        try:
-            ExtAPI.DataModel.Project.UnitSystem = WBUnitSystemType.ConsistentNMM
-            ok = True
-        except:
-            pass
-
-    # UI/application active unit system (same path used by Mechanical context_menu.py).
-    try:
-        ExtAPI.Application.ActiveUnitSystem = MechanicalUnitSystem.StandardNMM
-        ok = True
-    except:
-        try:
-            ExtAPI.Application.ActiveUnitSystem = MechanicalUnitSystemEnum.StandardNMM
-            ok = True
-        except:
-            try:
-                ExtAPI.Application.ActiveUnitSystem = 2  # StandardNMM numeric fallback.
-                ok = True
-            except:
-                pass
-
-    # Refresh unit-dependent UI if available.
-    try:
-        ExtAPI.Application.ScriptByName("jscript").CallJScript(
-            "updateAfterUnitChange",
-            [int(ExtAPI.Application.ActiveUnitSystem.GetMechanicalUnitSystemType())]
-        )
-    except:
-        pass
-
-    return ok
-
-
 def get_axis_base(label):
     return str(label)[-1].upper()
 
@@ -931,16 +879,6 @@ def main():
     if source_ns is None:
         return
 
-    if not set_units_to_nmm():
-        MessageBox.Show(
-            "Failed to set unit system to N-mm via API.\n"
-            "Please switch to StandardNMM (N, mm) and run again.",
-            APP_TITLE,
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Error
-        )
-        return
-
     analyses, analysis_labels = get_supported_analyses()
     if len(analyses) == 0:
         MessageBox.Show("No Static/Transient analysis environment found in this model.", APP_TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning)
@@ -986,27 +924,6 @@ def main():
         return
 
     lu = DataModel.CurrentConsistentUnitFromQuantityName("Length")
-    fu = DataModel.CurrentConsistentUnitFromQuantityName("Force")
-
-    if abs(convert_length(1.0, "mm", lu) - 1.0) > 1e-9:
-        MessageBox.Show(
-            "Unit check failed after switching to StandardNMM.\n"
-            "Active length unit is '{0}' (expected mm).".format(str(lu)),
-            APP_TITLE,
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Error
-        )
-        return
-
-    if abs(convert_force(1.0, "N", fu) - 1.0) > 1e-9:
-        MessageBox.Show(
-            "Unit check failed after switching to StandardNMM.\n"
-            "Active force unit is '{0}' (expected N).".format(str(fu)),
-            APP_TITLE,
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Error
-        )
-        return
 
     origin = [
         convert_length(ox_mm, "mm", lu),
@@ -1161,9 +1078,6 @@ def main():
     lines.append("Order: {0}".format("Reversed" if reverse else "Normal"))
     lines.append("Source NS: {0}".format(source_ns.Name))
     lines.append("Target analysis: {0}".format(target_analysis_name))
-    lines.append("Mechanical unit system: StandardNMM (N, mm)")
-    lines.append("Calculation length unit: {0}".format(str(lu)))
-    lines.append("Calculation force unit: {0}".format(str(fu)))
     lines.append("Load steps in target analysis: {0}".format(step_count))
     lines.append("Ordering origin [mm]: ({0}, {1}, {2})".format(ox_mm, oy_mm, oz_mm))
     lines.append("Input element count: {0}".format(len(element_ids)))

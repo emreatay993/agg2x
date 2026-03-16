@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telemetry Bar — EA Node Editor</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f1117;
+    --surface: #161b27;
+    --surface2: #1c2334;
+    --border: #252d3f;
+    --border-bright: #2e3a52;
+    --text-dim: #4a5568;
+    --text-mid: #718096;
+    --text: #a0aec0;
+    --text-bright: #cbd5e0;
+    --green: #48bb78;
+    --green-dim: #276749;
+    --green-glow: rgba(72,187,120,0.15);
+    --amber: #f6ad55;
+    --amber-dim: #7b5213;
+    --red: #fc8181;
+    --red-dim: #742a2a;
+    --blue: #63b3ed;
+    --blue-dim: #2a4a6b;
+    --purple: #b794f4;
+    --cyan: #76e4f7;
+    --cyan-dim: #1a4a52;
+  }
+
+  body {
+    background: #1a2035;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 40px 20px 20px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  /* ── Context wrapper showing bar in situ ── */
+  .editor-mock {
+    width: 100%;
+    max-width: 1400px;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 40px 80px rgba(0,0,0,0.6);
+  }
+
+  .editor-canvas {
+    height: 180px;
+    background: 
+      radial-gradient(ellipse at 30% 50%, rgba(99,179,237,0.03) 0%, transparent 60%),
+      repeating-linear-gradient(0deg, transparent, transparent 23px, rgba(255,255,255,0.02) 23px, rgba(255,255,255,0.02) 24px),
+      repeating-linear-gradient(90deg, transparent, transparent 23px, rgba(255,255,255,0.02) 23px, rgba(255,255,255,0.02) 24px),
+      #0d1117;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+  }
+
+  /* ══════════════════════════════════════
+     TELEMETRY BAR
+  ══════════════════════════════════════ */
+  .telemetry-bar {
+    display: flex;
+    align-items: stretch;
+    height: 34px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    user-select: none;
+    position: relative;
+    overflow: hidden;
+  }
+
+  /* subtle top highlight line */
+  .telemetry-bar::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, var(--border-bright) 20%, var(--border-bright) 80%, transparent 100%);
+    pointer-events: none;
+  }
+
+  /* ── Status pill (leftmost) ── */
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 14px 0 12px;
+    border-right: 1px solid var(--border);
+    min-width: 130px;
+    position: relative;
+    cursor: default;
+    transition: background 0.15s;
+  }
+  .status-pill:hover { background: rgba(255,255,255,0.03); }
+
+  .status-indicator {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green), 0 0 12px rgba(72,187,120,0.4);
+    flex-shrink: 0;
+    animation: pulse-green 2.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse-green {
+    0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--green), 0 0 12px rgba(72,187,120,0.4); }
+    50% { opacity: 0.7; box-shadow: 0 0 3px var(--green); }
+  }
+
+  .status-label {
+    display: flex;
+    flex-direction: column;
+    gap: 0px;
+    line-height: 1;
+  }
+  .status-state {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--green);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .status-sub {
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    margin-top: 1px;
+  }
+
+  /* ── Segment base ── */
+  .seg {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 0 10px;
+    border-right: 1px solid var(--border);
+    cursor: default;
+    transition: background 0.15s;
+    position: relative;
+  }
+  .seg:hover { background: rgba(255,255,255,0.03); }
+
+  .seg-label {
+    font-size: 9px;
+    font-weight: 500;
+    color: var(--text-dim);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-right: 8px;
+    white-space: nowrap;
+  }
+
+  /* ── Metric chips within segments ── */
+  .metric-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .chip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 6px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .chip:hover {
+    border-color: var(--border-bright);
+    background: rgba(255,255,255,0.05);
+  }
+
+  .chip-icon {
+    font-size: 10px;
+    line-height: 1;
+    opacity: 0.55;
+  }
+  .chip-key {
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.04em;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-weight: 400;
+  }
+  .chip-val {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-bright);
+    letter-spacing: 0.03em;
+    min-width: 14px;
+    text-align: right;
+  }
+  .chip-val.green { color: var(--green); }
+  .chip-val.amber { color: var(--amber); }
+  .chip-val.red { color: var(--red); }
+  .chip-val.blue { color: var(--blue); }
+  .chip-val.dim { color: var(--text-dim); }
+
+  /* ── Tooltip system ── */
+  .chip, .bar-chip {
+    position: relative;
+  }
+  .chip .tip, .bar-chip .tip {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1e2840;
+    border: 1px solid var(--border-bright);
+    border-radius: 4px;
+    padding: 6px 10px;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 100;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  }
+  .chip .tip::after, .bar-chip .tip::after {
+    content: '';
+    position: absolute;
+    top: 100%; left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent;
+    border-top-color: var(--border-bright);
+  }
+  .chip:hover .tip, .bar-chip:hover .tip {
+    display: block;
+  }
+  .tip-title {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-bright);
+    font-family: 'IBM Plex Sans', sans-serif;
+    letter-spacing: 0.03em;
+    display: block;
+    margin-bottom: 2px;
+  }
+  .tip-desc {
+    font-size: 9px;
+    color: var(--text-mid);
+    font-family: 'IBM Plex Sans', sans-serif;
+    display: block;
+  }
+
+  /* ── CPU/RAM bar chips ── */
+  .bar-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 7px 2px 6px;
+    cursor: default;
+    transition: border-color 0.15s;
+  }
+  .bar-chip:hover { border-color: var(--border-bright); }
+
+  .bar-chip-label {
+    font-size: 9px;
+    color: var(--text-dim);
+    letter-spacing: 0.06em;
+  }
+  .bar-track {
+    width: 48px;
+    height: 3px;
+    background: rgba(255,255,255,0.07);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.4s ease;
+  }
+  .bar-fill.cpu { background: var(--blue); width: 4%; }
+  .bar-fill.ram { background: var(--purple); width: 0%; }
+  .bar-fill.warn { background: var(--amber); }
+  .bar-fill.crit { background: var(--red); }
+
+  .bar-chip-val {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text);
+    min-width: 32px;
+    text-align: right;
+  }
+
+  /* ── Divider dot ── */
+  .dot-div {
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: var(--border-bright);
+    margin: 0 1px;
+  }
+
+  /* ── Right side spacer ── */
+  .spacer { flex: 1; }
+
+  /* ── Right cluster ── */
+  .right-cluster {
+    display: flex;
+    align-items: center;
+    border-left: 1px solid var(--border);
+    padding: 0 12px;
+    gap: 6px;
+  }
+
+  .right-cluster .chip-key { color: var(--text-dim); }
+
+  /* ── Network segment ── */
+  .net-seg {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 12px;
+    border-right: 1px solid var(--border);
+    cursor: default;
+    transition: background 0.15s;
+  }
+  .net-seg:hover { background: rgba(255,255,255,0.03); }
+
+  .net-item {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .net-icon {
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+  .net-val { font-size: 10px; color: var(--text-mid); font-weight: 400; }
+  .net-val.active { color: var(--cyan); }
+
+  /* ── Clock ── */
+  .clock-seg {
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 6px;
+    border-left: 1px solid var(--border);
+    min-width: 90px;
+  }
+  .clock-icon { font-size: 10px; color: var(--text-dim); }
+  .clock-time {
+    font-size: 10px;
+    color: var(--text-mid);
+    letter-spacing: 0.06em;
+    font-weight: 400;
+  }
+
+  /* ── Workspace badge ── */
+  .workspace-badge {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 12px;
+    border-left: 1px solid var(--border);
+    cursor: default;
+    transition: background 0.15s;
+  }
+  .workspace-badge:hover { background: rgba(255,255,255,0.03); }
+  .ws-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--blue);
+    box-shadow: 0 0 4px var(--blue);
+  }
+  .ws-name {
+    font-size: 10px;
+    color: var(--text-mid);
+    letter-spacing: 0.05em;
+  }
+
+  /* ── Zoom badge ── */
+  .zoom-badge {
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+    border-left: 1px solid var(--border);
+    gap: 4px;
+    cursor: default;
+  }
+  .zoom-label { font-size: 9px; color: var(--text-dim); letter-spacing: 0.08em; }
+  .zoom-val { font-size: 10px; color: var(--text-mid); font-weight: 500; }
+
+  /* ══════════════════════════════════════
+     DEMO CONTROLS BELOW
+  ══════════════════════════════════════ */
+  .demo-area {
+    background: #0a0d13;
+    border-top: 1px solid #1a2030;
+    padding: 28px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .demo-title {
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    border-bottom: 1px solid #1a2030;
+    padding-bottom: 10px;
+  }
+  .demo-controls {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .demo-btn {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    padding: 6px 14px;
+    border-radius: 3px;
+    border: 1px solid var(--border-bright);
+    background: var(--surface2);
+    color: var(--text-mid);
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: all 0.15s;
+  }
+  .demo-btn:hover { background: var(--border); color: var(--text-bright); }
+  .demo-btn.active { border-color: var(--green); color: var(--green); background: var(--green-glow); }
+  .demo-note {
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<div class="editor-mock">
+
+  <!-- Mock canvas area -->
+  <div class="editor-canvas">Node Canvas — EA Node Editor</div>
+
+  <!-- ════════════ TELEMETRY BAR ════════════ -->
+  <div class="telemetry-bar" id="bar">
+
+    <!-- STATUS -->
+    <div class="status-pill" id="statusPill" title="Runtime status">
+      <div class="status-indicator" id="statusDot"></div>
+      <div class="status-label">
+        <span class="status-state" id="statusState">Ready</span>
+        <span class="status-sub" id="statusSub">Idle</span>
+      </div>
+    </div>
+
+    <!-- JOB METRICS -->
+    <div class="seg">
+      <span class="seg-label">Jobs</span>
+      <div class="metric-group">
+
+        <div class="chip">
+          <span class="chip-icon">▶</span>
+          <span class="chip-key">Running</span>
+          <span class="chip-val dim" id="jobR">0</span>
+          <div class="tip">
+            <span class="tip-title">Running</span>
+            <span class="tip-desc">Jobs actively executing right now</span>
+          </div>
+        </div>
+
+        <div class="chip">
+          <span class="chip-icon">⏳</span>
+          <span class="chip-key">Queued</span>
+          <span class="chip-val dim" id="jobQ">0</span>
+          <div class="tip">
+            <span class="tip-title">Queued</span>
+            <span class="tip-desc">Jobs waiting to be dispatched</span>
+          </div>
+        </div>
+
+        <div class="chip">
+          <span class="chip-icon">✓</span>
+          <span class="chip-key">Done</span>
+          <span class="chip-val dim" id="jobD">0</span>
+          <div class="tip">
+            <span class="tip-title">Completed</span>
+            <span class="tip-desc">Jobs finished successfully this session</span>
+          </div>
+        </div>
+
+        <div class="chip">
+          <span class="chip-icon">✕</span>
+          <span class="chip-key">Failed</span>
+          <span class="chip-val dim" id="jobF">0</span>
+          <div class="tip">
+            <span class="tip-title">Failed</span>
+            <span class="tip-desc">Jobs that terminated with an error</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- CPU -->
+    <div class="seg">
+      <div class="bar-chip">
+        <span class="bar-chip-label">CPU</span>
+        <div class="bar-track">
+          <div class="bar-fill cpu" id="cpuBar"></div>
+        </div>
+        <span class="bar-chip-val" id="cpuVal">0%</span>
+        <div class="tip">
+          <span class="tip-title">CPU Usage</span>
+          <span class="tip-desc">Processor utilization across all cores</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- RAM -->
+    <div class="seg">
+      <div class="bar-chip">
+        <span class="bar-chip-label">Memory</span>
+        <div class="bar-track">
+          <div class="bar-fill ram" id="ramBar"></div>
+        </div>
+        <span class="bar-chip-val" id="ramVal">0.0 GB</span>
+        <div class="tip">
+          <span class="tip-title">Memory Usage</span>
+          <span class="tip-desc">RAM consumed out of total available</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- NODES -->
+    <div class="seg">
+      <span class="seg-label">Nodes</span>
+      <div class="metric-group">
+
+        <div class="chip">
+          <span class="chip-icon" style="color:#f6ad55">⚠</span>
+          <span class="chip-key">Warnings</span>
+          <span class="chip-val dim" id="nodeW">0</span>
+          <div class="tip">
+            <span class="tip-title">Node Warnings</span>
+            <span class="tip-desc">Non-fatal issues detected in the graph</span>
+          </div>
+        </div>
+
+        <div class="chip">
+          <span class="chip-icon" style="color:#fc8181">⊗</span>
+          <span class="chip-key">Errors</span>
+          <span class="chip-val dim" id="nodeE">0</span>
+          <div class="tip">
+            <span class="tip-title">Node Errors</span>
+            <span class="tip-desc">Nodes with unresolved runtime errors</span>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="spacer"></div>
+
+    <!-- WORKSPACE -->
+    <div class="workspace-badge" title="Active workspace">
+      <div class="ws-dot"></div>
+      <span class="ws-name">Workspace 1</span>
+    </div>
+
+    <!-- ZOOM -->
+    <div class="zoom-badge" title="Canvas zoom">
+      <span class="zoom-label">Zoom</span>
+      <span class="zoom-val">130%</span>
+    </div>
+
+    <!-- CLOCK -->
+    <div class="clock-seg" title="System time">
+      <span class="clock-icon">◷</span>
+      <span class="clock-time" id="clockTime">--:--:--</span>
+    </div>
+
+  </div>
+  <!-- ════════════ END TELEMETRY BAR ════════════ -->
+
+  <!-- Demo playground -->
+  <div class="demo-area">
+    <div class="demo-title">Simulate state</div>
+    <div class="demo-controls">
+      <button class="demo-btn active" onclick="setState('idle')">Idle</button>
+      <button class="demo-btn" onclick="setState('running')">Running</button>
+      <button class="demo-btn" onclick="setState('warning')">Warning</button>
+      <button class="demo-btn" onclick="setState('error')">Error</button>
+      <button class="demo-btn" onclick="setState('busy')">High Load</button>
+      <span class="demo-note">Click to preview different runtime states</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // ── Clock ──
+  function tick() {
+    const now = new Date();
+    document.getElementById('clockTime').textContent =
+      now.toTimeString().slice(0,8);
+  }
+  tick(); setInterval(tick, 1000);
+
+  // ── State presets ──
+  const states = {
+    idle: {
+      statusState: 'Ready', statusSub: 'Idle',
+      dotColor: '#48bb78', dotGlow: 'rgba(72,187,120,0.4)',
+      dotAnim: 'pulse-green',
+      jobR:'0', jobQ:'0', jobD:'0', jobF:'0',
+      cpu:4, ram:0, ramStr:'0.0 GB',
+      nodeW:'0', nodeE:'0',
+      cpuColor:'#63b3ed', ramColor:'#b794f4'
+    },
+    running: {
+      statusState: 'Running', statusSub: 'Processing',
+      dotColor: '#63b3ed', dotGlow: 'rgba(99,179,237,0.4)',
+      dotAnim: 'pulse-blue',
+      jobR:'3', jobQ:'7', jobD:'12', jobF:'0',
+      cpu:38, ram:42, ramStr:'3.4 GB',
+      nodeW:'0', nodeE:'0',
+      cpuColor:'#63b3ed', ramColor:'#b794f4'
+    },
+    warning: {
+      statusState: 'Caution', statusSub: '2 warnings',
+      dotColor: '#f6ad55', dotGlow: 'rgba(246,173,85,0.4)',
+      dotAnim: 'pulse-amber',
+      jobR:'1', jobQ:'2', jobD:'8', jobF:'0',
+      cpu:22, ram:61, ramStr:'4.9 GB',
+      nodeW:'2', nodeE:'0',
+      cpuColor:'#63b3ed', ramColor:'#f6ad55'
+    },
+    error: {
+      statusState: 'Error', statusSub: '1 failure',
+      dotColor: '#fc8181', dotGlow: 'rgba(252,129,129,0.4)',
+      dotAnim: 'pulse-red',
+      jobR:'0', jobQ:'0', jobD:'5', jobF:'1',
+      cpu:0, ram:28, ramStr:'2.2 GB',
+      nodeW:'0', nodeE:'1',
+      cpuColor:'#63b3ed', ramColor:'#b794f4'
+    },
+    busy: {
+      statusState: 'Running', statusSub: 'High load',
+      dotColor: '#fc8181', dotGlow: 'rgba(252,129,129,0.5)',
+      dotAnim: 'pulse-red',
+      jobR:'12', jobQ:'31', jobD:'47', jobF:'2',
+      cpu:94, ram:87, ramStr:'7.0 GB',
+      nodeW:'3', nodeE:'2',
+      cpuColor:'#fc8181', ramColor:'#fc8181'
+    }
+  };
+
+  // Inject keyframes dynamically
+  const styleEl = document.createElement('style');
+  styleEl.textContent = `
+    @keyframes pulse-blue {
+      0%,100%{opacity:1;box-shadow:0 0 6px #63b3ed,0 0 12px rgba(99,179,237,0.4);}
+      50%{opacity:0.7;box-shadow:0 0 3px #63b3ed;}
+    }
+    @keyframes pulse-amber {
+      0%,100%{opacity:1;box-shadow:0 0 6px #f6ad55,0 0 12px rgba(246,173,85,0.4);}
+      50%{opacity:0.7;box-shadow:0 0 3px #f6ad55;}
+    }
+    @keyframes pulse-red {
+      0%,100%{opacity:1;box-shadow:0 0 6px #fc8181,0 0 12px rgba(252,129,129,0.5);}
+      50%{opacity:0.5;box-shadow:0 0 3px #fc8181;}
+    }
+  `;
+  document.head.appendChild(styleEl);
+
+  let activeBtn = document.querySelector('.demo-btn.active');
+
+  function setState(name) {
+    const s = states[name];
+    if (!s) return;
+
+    document.getElementById('statusState').textContent = s.statusState;
+    document.getElementById('statusSub').textContent = s.statusSub;
+
+    const dot = document.getElementById('statusDot');
+    dot.style.background = s.dotColor;
+    dot.style.boxShadow = `0 0 6px ${s.dotColor}, 0 0 12px ${s.dotGlow}`;
+    dot.style.animation = `${s.dotAnim} 2.5s ease-in-out infinite`;
+
+    document.getElementById('jobR').textContent = s.jobR;
+    document.getElementById('jobQ').textContent = s.jobQ;
+    document.getElementById('jobD').textContent = s.jobD;
+    document.getElementById('jobF').textContent = s.jobF;
+
+    // Job R color
+    document.getElementById('jobR').className = 'chip-val ' + (parseInt(s.jobR)>0 ? 'blue' : 'dim');
+    document.getElementById('jobQ').className = 'chip-val ' + (parseInt(s.jobQ)>0 ? 'amber' : 'dim');
+    document.getElementById('jobD').className = 'chip-val ' + (parseInt(s.jobD)>0 ? 'green' : 'dim');
+    document.getElementById('jobF').className = 'chip-val ' + (parseInt(s.jobF)>0 ? 'red' : 'dim');
+
+    // CPU bar
+    const cpuBar = document.getElementById('cpuBar');
+    cpuBar.style.width = s.cpu + '%';
+    cpuBar.style.background = s.cpuColor;
+    document.getElementById('cpuVal').textContent = s.cpu + '%';
+    document.getElementById('cpuVal').style.color = s.cpuColor;
+
+    // RAM bar
+    const ramBar = document.getElementById('ramBar');
+    ramBar.style.width = s.ram + '%';
+    ramBar.style.background = s.ramColor;
+    document.getElementById('ramVal').textContent = s.ramStr;
+    document.getElementById('ramVal').style.color = s.ramColor;
+
+    // Nodes
+    document.getElementById('nodeW').textContent = s.nodeW;
+    document.getElementById('nodeE').textContent = s.nodeE;
+    document.getElementById('nodeW').className = 'chip-val ' + (parseInt(s.nodeW)>0 ? 'amber' : 'dim');
+    document.getElementById('nodeE').className = 'chip-val ' + (parseInt(s.nodeE)>0 ? 'red' : 'dim');
+
+    // Button active state
+    if (activeBtn) activeBtn.classList.remove('active');
+    activeBtn = event.target;
+    activeBtn.classList.add('active');
+  }
+</script>
+</body>
+</html>

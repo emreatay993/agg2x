@@ -1,13 +1,13 @@
-# mos_app.py — MoS% Calculator with Strength Type (YTS/UTS) dropdown + configurable preview cap
+# mos_app.py : MoS% Calculator with Strength Type (YTS/UTS) dropdown + configurable preview cap
 # Default: MoS% = [1 - sigma_max / (Strength(T)/FS)] * 100
 # Strength applies to allowable (allowable = Strength/FS). Preview table is capped for speed.
 
 import sys, os, re, time
 import numpy as np
 import pandas as pd
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
-APP_NAME, VERSION = "MoS Calculator", "0.5.0"
+APP_NAME, VERSION = "MoS Calculator", "0.5.1"
 
 # ---------- utilities ----------
 def c_to_k(c): return c + 273.15
@@ -76,8 +76,8 @@ def temp_patterns():
         r"t(c|k)",
         r"tref",
         r"temp[_\s]*c",
-        r"t\s*\(\s*°?c\s*\)",
-        r"temp\s*\(\s*°?c\s*\)",
+        r"t\s*\(\s*Â°?c\s*\)",
+        r"temp\s*\(\s*Â°?c\s*\)",
         r"\bbfe\b",
         r"bfe\s*\(\s*\)",
     ]
@@ -101,9 +101,9 @@ class PandasModel(QtCore.QAbstractTableModel):
     def columnCount(self, parent=None):
         return 0 if parent and parent.isValid() else len(self._df.columns)
 
-    def data(self, index, role=QtCore.Qt.DisplayRole):
+    def data(self, index, role=QtCore.Qt.ItemDataRole.DisplayRole):
         if not index.isValid(): return None
-        if role in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+        if role in (QtCore.Qt.ItemDataRole.DisplayRole, QtCore.Qt.ItemDataRole.EditRole):
             val = self._df.iat[index.row(), index.column()]
             if pd.isna(val):
                 return ""
@@ -119,8 +119,8 @@ class PandasModel(QtCore.QAbstractTableModel):
         return None
 
     def headerData(self, section, orientation, role):
-        if role != QtCore.Qt.DisplayRole: return None
-        if orientation == QtCore.Qt.Horizontal:
+        if role != QtCore.Qt.ItemDataRole.DisplayRole: return None
+        if orientation == QtCore.Qt.Orientation.Horizontal:
             return str(self._df.columns[section])
         return str(self._df.index[section])
 
@@ -176,17 +176,17 @@ class TableCopyHelper(QtCore.QObject):
         super().__init__(table)
         self.table = table
         self.table.installEventFilter(self)
-        self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
-        self.table.setContextMenuPolicy(QtCore.Qt.ActionsContextMenu)
-        act_copy = QtWidgets.QAction("Copy", self.table)
-        act_copy.setShortcut(QtGui.QKeySequence.Copy)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectItems)
+        self.table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.ActionsContextMenu)
+        act_copy = QtGui.QAction("Copy", self.table)
+        act_copy.setShortcut(QtGui.QKeySequence.StandardKey.Copy)
         act_copy.triggered.connect(self.copy_selection)
         self.table.addAction(act_copy)
 
     def eventFilter(self, obj, event):
-        if obj is self.table and event.type() == QtCore.QEvent.KeyPress:
-            if event.matches(QtGui.QKeySequence.Copy):
+        if obj is self.table and event.type() == QtCore.QEvent.Type.KeyPress:
+            if event.matches(QtGui.QKeySequence.StandardKey.Copy):
                 self.copy_selection()
                 return True
         return super().eventFilter(obj, event)
@@ -328,13 +328,13 @@ class MainWindow(QtWidgets.QMainWindow):
         tb = QtWidgets.QToolBar()
         tb.setMovable(False)
         self.addToolBar(tb)
-        act_theme = QtWidgets.QAction("Toggle Theme", self)
+        act_theme = QtGui.QAction("Toggle Theme", self)
         act_theme.setToolTip("Switch between dark and light theme")
         act_theme.triggered.connect(self._toggle_theme)
         tb.addAction(act_theme)
 
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.setTabPosition(QtWidgets.QTabWidget.West)
+        self.tabs.setTabPosition(QtWidgets.QTabWidget.TabPosition.West)
         layout.addWidget(self.tabs)
         self._build_tab_material()
         self._build_tab_ansys()
@@ -367,7 +367,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_mat_units.addItems(["C", "K"])
         self.combo_mat_units.setCurrentText("C")
         self.combo_mat_units.setMinimumWidth(140)
-        self.combo_mat_units.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.combo_mat_units.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.combo_mat_units.setToolTip(
             "Units of the material temperature column:\n"
             "- C: values are in degrees Celsius\n"
@@ -396,7 +396,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_mat_strength_units.addItems(["MPa", "Pa", "GPa"])
         self.combo_mat_strength_units.setCurrentText("MPa")
         self.combo_mat_strength_units.setMinimumWidth(140)
-        self.combo_mat_strength_units.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.combo_mat_strength_units.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.combo_mat_strength_units.setToolTip(
             "Units of the material strength column:\n"
             "- MPa: no conversion\n"
@@ -424,7 +424,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_mat = QtWidgets.QTableView()
         if hasattr(self.tbl_mat, "setUniformRowHeights"):
             self.tbl_mat.setUniformRowHeights(True)
-        self.tbl_mat.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.tbl_mat.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.tbl_mat.setToolTip("Preview of material data (sortable)")
         self._enable_table_copy(self.tbl_mat)
         self.model_mat = PandasModel()
@@ -446,7 +446,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_ans = QtWidgets.QPushButton("Load ANSYS CSV/XLSX")
         self.btn_ans.setToolTip(
             "Load ANSYS results table (CSV/XLSX/TXT)\n"
-            "Expected columns (example): NodeID, Stress_MPa, Temp_C / TEMP_C / T(°C) / TEMP(°C) / TREF / BFE()\n"
+            "Expected columns (example): NodeID, Stress_MPa, Temp_C / TEMP_C / T(Â°C) / TEMP(Â°C) / TREF / BFE()\n"
             "Accepted separators: comma or tab (auto-detected)\n"
             "Stress columns labeled (Pa) are auto-converted to (MPa)"
         )
@@ -457,7 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Load a separate NodeID vs Temperature file and merge by NodeID.\n"
             "Use this when your ANSYS stress file has no temperature column.\n"
             "The temperature values must use the selected ANSYS T units.\n"
-            "Expected columns (example): NodeID, Temp_C / TEMP_C / T(°C) / TEMP(°C) / TREF / BFE()\n"
+            "Expected columns (example): NodeID, Temp_C / TEMP_C / T(Â°C) / TEMP(Â°C) / TREF / BFE()\n"
             "Accepted separators: comma or tab\n"
             "If duplicate NodeIDs exist, the first occurrence is kept"
         )
@@ -470,7 +470,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_ans_units.addItems(["C", "K"])
         self.combo_ans_units.setCurrentText("C")
         self.combo_ans_units.setMinimumWidth(140)
-        self.combo_ans_units.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.combo_ans_units.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.combo_ans_units.setToolTip(
             "Units of the ANSYS temperature column:\n"
             "- C: values are in degrees Celsius\n"
@@ -483,7 +483,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combo_ans_stress_units.addItems(["MPa", "Pa"])
         self.combo_ans_stress_units.setCurrentText("MPa")
         self.combo_ans_stress_units.setMinimumWidth(140)
-        self.combo_ans_stress_units.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.combo_ans_stress_units.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.combo_ans_stress_units.setToolTip(
             "Units of the ANSYS stress column:\n"
             "- MPa: no conversion\n"
@@ -538,7 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_ans = QtWidgets.QTableView()
         if hasattr(self.tbl_ans, "setUniformRowHeights"):
             self.tbl_ans.setUniformRowHeights(True)
-        self.tbl_ans.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.tbl_ans.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.tbl_ans.setToolTip("Preview of ANSYS results (sortable)")
         self._enable_table_copy(self.tbl_ans)
         self.model_ans = PandasModel()
@@ -575,7 +575,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_percent.setChecked(True)
         self.chk_percent.setToolTip(
             "If checked, MoS is reported as percent:\n"
-            "MoS% = (1 - stress/allowable) × 100\n"
+            "MoS% = (1 - stress/allowable) Ã— 100\n"
             "Unchecked: MoS ratio = 1 - stress/allowable"
         )
         v.addWidget(self.chk_percent)
@@ -633,7 +633,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_node_explain.setToolTip(
             "Show step-by-step MoS calculation for the NodeID.\n"
             "Uses: Allowable = Strength / FS, MoS = 1 - Stress/Allowable\n"
-            "If MoS% output is enabled: MoS% = MoS × 100"
+            "If MoS% output is enabled: MoS% = MoS Ã— 100"
         )
         self.btn_node_explain.clicked.connect(self._explain_mos)
         top.addWidget(self.btn_node_explain)
@@ -652,7 +652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tbl_out = QtWidgets.QTableView()
         if hasattr(self.tbl_out, "setUniformRowHeights"):
             self.tbl_out.setUniformRowHeights(True)
-        self.tbl_out.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        self.tbl_out.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.tbl_out.setToolTip("Preview of computed results (sortable)")
         self._enable_table_copy(self.tbl_out)
         self.model_out = PandasModel()
@@ -860,10 +860,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Replace Material Data?",
                 "Dropping this file will replace the currently loaded material data.\n"
                 "Do you want to continue?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No
             )
-            if reply != QtWidgets.QMessageBox.Yes:
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
         self._load_material_path(path)
 
@@ -1134,10 +1134,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Replace ANSYS Data?",
                 "Dropping this file will replace the currently loaded ANSYS stress data.\n"
                 "Do you want to continue?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                QtWidgets.QMessageBox.No
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No
             )
-            if reply == QtWidgets.QMessageBox.Yes:
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
                 self._load_ansys_path(path)
 
     # ---------- compute ----------
@@ -1185,7 +1185,7 @@ class MainWindow(QtWidgets.QMainWindow):
         strength_type = self.combo_strength_type.currentText().upper().strip()
 
         self.btn_compute.setEnabled(False)
-        self.status.showMessage("Computing…")
+        self.status.showMessage("Computingâ€¦")
 
         self.thread = QtCore.QThread()
         self.worker = ComputeWorker(
@@ -1298,50 +1298,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.txt_node_filter.clear()
         self._apply_filter()
 
-    def _get_selected_node_id(self):
+    def _get_selected_result_row(self):
         sel = self.tbl_out.selectionModel()
         if sel is None:
             return None
-        rows = sel.selectedRows()
-        if not rows:
-            idxs = sel.selectedIndexes()
-            if not idxs:
-                return None
-            row = idxs[0].row()
-        else:
-            row = rows[0].row()
+
+        idx = self.tbl_out.currentIndex()
+        if not idx.isValid():
+            rows = sel.selectedRows()
+            if rows:
+                idx = rows[0]
+            else:
+                idxs = sel.selectedIndexes()
+                if not idxs:
+                    return None
+                idx = idxs[0]
+
+        source_idx = self.proxy_model_out.mapToSource(idx)
+        row = source_idx.row()
         df_view = self.model_out._df
-        if "NodeID" not in df_view.columns:
+        if row < 0 or row >= len(df_view):
+            return None
+        return df_view.iloc[row].copy()
+
+    def _get_selected_node_id(self):
+        row = self._get_selected_result_row()
+        if row is None or "NodeID" not in row.index:
             return None
         try:
-            return int(float(df_view.iloc[row]["NodeID"]))
+            return int(float(row["NodeID"]))
         except Exception:
             return None
 
-    def _explain_mos(self):
-        if self.results_df.empty:
-            QtWidgets.QMessageBox.information(self, "No Data", "Run a computation first.")
-            return
-
-        node_id = None
-        text = self.txt_node_filter.text().strip()
-        if text:
-            try:
-                node_id = int(text)
-            except ValueError:
-                QtWidgets.QMessageBox.warning(self, "Invalid Node ID", "Node ID must be an integer.")
-                return
-        if node_id is None:
-            node_id = self._get_selected_node_id()
-        if node_id is None:
-            QtWidgets.QMessageBox.warning(self, "No Node Selected", "Enter a NodeID or select a row.")
-            return
-
+    def _find_result_row_by_node_id(self, node_id):
         if "NodeID" not in self.results_df.columns:
-            QtWidgets.QMessageBox.warning(self, "Missing NodeID", "Results do not contain a NodeID column.")
-            return
-
-        # Find matching row
+            return None
         try:
             series_num = pd.to_numeric(self.results_df["NodeID"], errors="coerce")
             if series_num.notna().any():
@@ -1350,11 +1341,55 @@ class MainWindow(QtWidgets.QMainWindow):
                 row = self.results_df.loc[self.results_df["NodeID"].astype(str) == str(node_id)]
         except Exception:
             row = self.results_df.loc[self.results_df["NodeID"].astype(str) == str(node_id)]
-
         if row.empty:
-            QtWidgets.QMessageBox.warning(self, "Node Not Found", f"Node ID {node_id} does not exist in results.")
+            return None
+        return row.iloc[0].copy()
+
+    def _get_explain_target_row(self):
+        selected_row = self._get_selected_result_row()
+        if selected_row is not None:
+            return selected_row, None
+
+        text = self.txt_node_filter.text().strip()
+        if not text:
+            return None, "No Node Selected"
+        try:
+            node_id = int(text)
+        except ValueError:
+            return None, "Invalid Node ID"
+
+        row = self._find_result_row_by_node_id(node_id)
+        if row is None:
+            return None, "Node Not Found"
+        return row, None
+
+    def _explain_mos(self):
+        if self.results_df.empty:
+            QtWidgets.QMessageBox.information(self, "No Data", "Run a computation first.")
             return
-        r = row.iloc[0]
+
+        if "NodeID" not in self.results_df.columns:
+            QtWidgets.QMessageBox.warning(self, "Missing NodeID", "Results do not contain a NodeID column.")
+            return
+
+        r, err = self._get_explain_target_row()
+        if err == "No Node Selected":
+            QtWidgets.QMessageBox.warning(self, "No Node Selected", "Enter a NodeID or select a row.")
+            return
+        if err == "Invalid Node ID":
+            QtWidgets.QMessageBox.warning(self, "Invalid Node ID", "Node ID must be an integer.")
+            return
+        if err == "Node Not Found":
+            QtWidgets.QMessageBox.warning(self, "Node Not Found", f"Node ID {self.txt_node_filter.text().strip()} does not exist in results.")
+            return
+        if r is None:
+            QtWidgets.QMessageBox.warning(self, "No Node Selected", "Enter a NodeID or select a row.")
+            return
+
+        try:
+            node_id = int(float(r.get("NodeID")))
+        except Exception:
+            node_id = str(r.get("NodeID", "N/A"))
 
         stress = r.get("Stress_MPa", np.nan)
         temp = r.get("Temp_C", np.nan)
@@ -1420,9 +1455,9 @@ class MainWindow(QtWidgets.QMainWindow):
             lines.append(f"Stress / Allowable = {fmt(stress)} / {fmt(allowable)} = {fmt(ratio)}")
             lines.append(f"MoS = 1 - {fmt(ratio)} = {fmt(mos_ratio)}")
         if mos_col == "MoS_%":
-            lines.append("MoS% = MoS × 100")
+            lines.append("MoS% = MoS * 100")
             if mos_percent is not None:
-                lines.append(f"MoS% = {fmt(mos_ratio)} × 100 = {fmt(mos_percent)}")
+                lines.append(f"MoS% = {fmt(mos_ratio)} * 100 = {fmt(mos_percent)}")
             lines.append(f"Reported MoS% = {fmt(mos_val)}")
         else:
             lines.append(f"Reported MoS = {fmt(mos_val)}")
@@ -1446,14 +1481,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
 # ---------- main ----------
 def main():
-    # Enable High DPI scaling
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
-
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()

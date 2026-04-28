@@ -159,6 +159,21 @@ def tree_path(obj):
     return " / ".join([safe_name(x) for x in parent_chain(obj)])
 
 
+def is_suppressed(obj):
+    try:
+        if bool(obj.Suppressed):
+            return True
+    except:
+        pass
+    try:
+        state = safe_text(obj.ObjectState).lower().replace("_", " ")
+        if "suppressed" in state:
+            return True
+    except:
+        pass
+    return False
+
+
 def owner_of(obj):
     chain = parent_chain(obj)
     for item in chain:
@@ -179,11 +194,15 @@ def udr_expression(udr):
         return ""
 
 
-def collect_udrs(folder):
+def collect_udrs(folder, log=None):
     found = []
 
     def walk(node):
         for child in safe_children(node):
+            if is_suppressed(child):
+                if log is not None:
+                    log.info("Skipping suppressed object: " + tree_path(child))
+                continue
             if is_udr(child):
                 if udr_expression(child) in EXPRESSIONS:
                     found.append(child)
@@ -594,6 +613,9 @@ def discover_environments(log):
         folder_name = safe_name(folder)
         if folder_name not in [INDIVIDUAL_ROOT, SCREENING_ROOT]:
             continue
+        if is_suppressed(folder):
+            log.info("Skipping suppressed result folder: " + tree_path(folder))
+            continue
         owner = owner_of(folder)
         if owner is None:
             continue
@@ -601,7 +623,7 @@ def discover_environments(log):
         if key not in envs_by_key:
             envs_by_key[key] = BoltEnvironment(owner)
         env = envs_by_key[key]
-        udrs = collect_udrs(folder)
+        udrs = collect_udrs(folder, log)
         if folder_name == INDIVIDUAL_ROOT:
             env.individual_root = folder
             for udr in udrs:
@@ -2648,6 +2670,18 @@ def format_sheet_finish(ws):
     freeze_top_row(ws)
 
 
+def add_excel_sheet_after_last(wb):
+    sheets = wb.Worksheets
+    after = sheets[sheets.Count]
+    try:
+        return sheets.Add(System.Type.Missing, after, 1, System.Type.Missing)
+    except:
+        try:
+            return sheets.Add(After=after)
+        except:
+            return sheets.Add(None, after)
+
+
 def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log, progress=None, start_percent=86, end_percent=97):
     excel_type = System.Type.GetTypeFromProgID("Excel.Application")
     if excel_type is None:
@@ -2696,19 +2730,19 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
         format_sheet_finish(ws)
         sheet_progress("Summary")
 
-        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws = add_excel_sheet_after_last(wb)
         ws.Name = sanitize_sheet_name("Tidy_Data", used_names)
         write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time", "Quantity", "QuantityType", "Value", "Unit", "Notes"], iter_tidy_rows(rows_by_bolt, unit_by_expr))
         format_sheet_finish(ws)
         sheet_progress("Tidy_Data")
 
-        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws = add_excel_sheet_after_last(wb)
         ws.Name = sanitize_sheet_name("Wide_All_Bolts", used_names)
         write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time"] + WIDE_VALUE_COLUMNS + ["Notes"], iter_wide_rows(rows_by_bolt))
         format_sheet_finish(ws)
         sheet_progress("Wide_All_Bolts")
 
-        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws = add_excel_sheet_after_last(wb)
         ws.Name = sanitize_sheet_name("Units", used_names)
         unit_rows = []
         definitions = {
@@ -2728,7 +2762,7 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
         sheet_progress("Units")
 
         for bolt in sorted(rows_by_bolt.keys()):
-            ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+            ws = add_excel_sheet_after_last(wb)
             ws.Name = sanitize_sheet_name("Bolt_" + bolt, used_names)
             hist_rows = []
             for row in rows_by_bolt[bolt]:
@@ -2758,7 +2792,7 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
             sheet_progress("Bolt_" + bolt)
 
         if existing_screening:
-            ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+            ws = add_excel_sheet_after_last(wb)
             ws.Name = sanitize_sheet_name("Existing_Screening", used_names)
             data_rows = []
             for row in existing_screening:
@@ -2776,13 +2810,13 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
             format_sheet_finish(ws)
             sheet_progress("Existing_Screening")
 
-        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws = add_excel_sheet_after_last(wb)
         ws.Name = sanitize_sheet_name("Meta", used_names)
         write_table_to_sheet(ws, 1, 1, ["Field", "Value"], manifest_rows)
         format_sheet_finish(ws)
         sheet_progress("Meta")
 
-        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws = add_excel_sheet_after_last(wb)
         ws.Name = sanitize_sheet_name("Log", used_names)
         for i, line in enumerate(log.lines):
             set_cell(ws, i + 1, 1, line)
@@ -2924,7 +2958,7 @@ class ExportOptionsForm(Form):
         self.include_time_history = True
         self.include_existing_screening = True
         self.use_tabular_beta = False
-        self.use_tabular_pane_beta = False
+        self.use_tabular_pane_beta = True
         self.use_plotdata_beta = False
         self.use_dpf_beta = False
         self.use_dpf_joint_beta = False
@@ -3034,9 +3068,9 @@ class ExportOptionsForm(Form):
         self.show_beta_options_check.Text = "Show beta extraction options"
         self.show_beta_options_check.Location = Point(18, 84)
         self.show_beta_options_check.Size = Size(260, 24)
-        self.show_beta_options_check.Checked = False
+        self.show_beta_options_check.Checked = True
         self.show_beta_options_check.CheckedChanged += self.on_show_beta_options_changed
-        attach_tip(self.tooltip, self.show_beta_options_check, "Reveals experimental extraction paths. Keep this unchecked for the conservative scalar UDR export path. When this is turned off, all beta selections are cleared so a hidden beta extractor cannot run accidentally.")
+        attach_tip(self.tooltip, self.show_beta_options_check, "Shows extraction backend choices. The fast Tabular Data pane scrape is selected by default; turn this off to clear beta selections and use the conservative scalar UDR export path.")
         opt_group.Controls.Add(self.show_beta_options_check)
 
         self.tabular_beta_check = CheckBox()
@@ -3052,7 +3086,7 @@ class ExportOptionsForm(Form):
         self.tabular_pane_beta_check.Text = "Beta: fast scrape Tabular Data pane all sets"
         self.tabular_pane_beta_check.Location = Point(18, 140)
         self.tabular_pane_beta_check.Size = Size(540, 24)
-        self.tabular_pane_beta_check.Checked = False
+        self.tabular_pane_beta_check.Checked = True
         self.tabular_pane_beta_check.Visible = False
         attach_tip(self.tooltip, self.tabular_pane_beta_check, "Fast pane scrape. Assumes evaluated results are already present, activates each individual bolt UDR, reads the visible Tabular Data pane grid directly, reuses the first successful table layout, and records pane-read failures as misses after a successful precheck.")
         opt_group.Controls.Add(self.tabular_pane_beta_check)

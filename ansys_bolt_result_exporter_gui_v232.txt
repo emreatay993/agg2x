@@ -364,7 +364,7 @@ def sanitize_file_name(text):
     text = safe_text(text).strip()
     bad = System.IO.Path.GetInvalidFileNameChars()
     for ch in bad:
-        text = text.replace(ch, "_")
+        text = text.replace(safe_text(ch), "_")
     text = re.sub(r"\s+", "_", text)
     if not text:
         text = "unnamed"

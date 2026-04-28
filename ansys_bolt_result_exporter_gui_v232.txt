@@ -1,0 +1,1186 @@
+# ANSYS Mechanical v232 IronPython script
+# Bolt ENFO/ENMO result exporter with a Windows Forms GUI.
+#
+# Copy-paste this whole file into the Mechanical scripting console.
+# It expects bolt UDR folders produced with names like:
+#   Bolt Results/ENFOX/ENFOX_NS_BoltNode_001
+#   Bolt Results - Max/Min Screening/ENFOX/ALL_BOLT_NODES_TOGETHER/...
+
+import clr
+import os
+import re
+import math
+import traceback
+from datetime import datetime
+
+clr.AddReference("System")
+clr.AddReference("System.Drawing")
+clr.AddReference("System.Windows.Forms")
+
+import System
+from System.Drawing import Point, Size
+from System.Windows.Forms import (
+    Application,
+    BorderStyle,
+    Button,
+    CheckBox,
+    ComboBox,
+    ComboBoxStyle,
+    DialogResult,
+    FolderBrowserDialog,
+    Form,
+    GroupBox,
+    Label,
+    MessageBox,
+    MessageBoxButtons,
+    MessageBoxIcon,
+    RadioButton,
+    ScrollBars,
+    TextBox,
+)
+
+from Ansys.Mechanical.DataModel.Enums import DataModelObjectCategory
+
+try:
+    from Ansys.Mechanical.DataModel.Enums import SetDriverStyle
+except:
+    SetDriverStyle = None
+
+
+EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ", "ENMOX", "ENMOY", "ENMOZ"]
+INDIVIDUAL_ROOT = "Bolt Results"
+SCREENING_ROOT = "Bolt Results - Max/Min Screening"
+SCREENING_LABELS = [
+    "MaximumOverTime",
+    "TimeOfMaximum",
+    "MinimumOverTime",
+    "TimeOfMinimum",
+]
+SCREENING_DRIVER_TO_LABEL = {
+    "MaximumOverTime": "MaximumOverTime",
+    "Maximum Over Time": "MaximumOverTime",
+    "TimeOfMaximum": "TimeOfMaximum",
+    "Time Of Maximum": "TimeOfMaximum",
+    "MinimumOverTime": "MinimumOverTime",
+    "Minimum Over Time": "MinimumOverTime",
+    "TimeOfMinimum": "TimeOfMinimum",
+    "Time Of Minimum": "TimeOfMinimum",
+}
+
+
+def safe_text(value):
+    if value is None:
+        return ""
+    try:
+        text = str(value)
+    except:
+        try:
+            text = value.ToString()
+        except:
+            text = "<unprintable>"
+    return text.replace("\r", " ").replace("\n", " ")
+
+
+def safe_name(obj):
+    try:
+        return safe_text(obj.Name)
+    except:
+        return "<no name>"
+
+
+def safe_category(obj):
+    try:
+        return safe_text(obj.DataModelObjectCategory)
+    except:
+        return "<unknown>"
+
+
+def safe_object_id(obj):
+    try:
+        return safe_text(obj.ObjectId)
+    except:
+        return safe_category(obj) + "::" + safe_name(obj) + "::" + safe_text(id(obj))
+
+
+def safe_children(obj):
+    try:
+        return list(obj.Children)
+    except:
+        return []
+
+
+def get_parent(obj):
+    try:
+        return obj.Parent
+    except:
+        return None
+
+
+def parent_chain(obj):
+    chain = []
+    cur = obj
+    for _ in range(40):
+        if cur is None:
+            break
+        chain.append(cur)
+        cur = get_parent(cur)
+    chain.reverse()
+    return chain
+
+
+def tree_path(obj):
+    return " / ".join([safe_name(x) for x in parent_chain(obj)])
+
+
+def owner_of(obj):
+    chain = parent_chain(obj)
+    for item in chain:
+        cat = safe_category(item)
+        if cat == "Analysis" or cat == "SolutionCombination":
+            return item
+    return None
+
+
+def is_udr(obj):
+    return safe_category(obj) == "UserDefinedResult"
+
+
+def udr_expression(udr):
+    try:
+        return safe_text(udr.Expression).strip().upper()
+    except:
+        return ""
+
+
+def collect_udrs(folder):
+    found = []
+
+    def walk(node):
+        for child in safe_children(node):
+            if is_udr(child):
+                if udr_expression(child) in EXPRESSIONS:
+                    found.append(child)
+            else:
+                walk(child)
+
+    walk(folder)
+    return found
+
+
+def get_driver_label(udr):
+    raw_values = []
+    try:
+        raw_values.append(safe_text(udr.PropertyByName("SetDriver").StringValue))
+    except:
+        pass
+    try:
+        raw_values.append(safe_text(udr.By))
+    except:
+        pass
+    for raw in raw_values:
+        if raw in SCREENING_DRIVER_TO_LABEL:
+            return SCREENING_DRIVER_TO_LABEL[raw]
+    nm = safe_name(udr)
+    for label in SCREENING_LABELS:
+        if label.lower() in nm.lower():
+            return label
+    return ""
+
+
+def bolt_id_from_udr(udr):
+    candidates = [safe_name(udr)]
+    try:
+        candidates.append(safe_name(udr.Location))
+    except:
+        pass
+    for text in candidates:
+        m = re.search(r"NS_BoltNode_([0-9]+)", text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def node_selection_name(udr):
+    try:
+        return safe_name(udr.Location)
+    except:
+        return ""
+
+
+def result_unit(udr):
+    try:
+        return safe_text(udr.OutputUnit)
+    except:
+        return ""
+
+
+def first_number(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except:
+        pass
+    text = safe_text(value)
+    m = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except:
+        return None
+
+
+def number_or_text(value):
+    num = first_number(value)
+    if num is None:
+        return safe_text(value)
+    if abs(num) < 1.0e-300:
+        num = 0.0
+    return num
+
+
+def fmt_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return safe_text(value)
+        return "{0:.12g}".format(value)
+    return safe_text(value)
+
+
+def approx_equal(a, b):
+    if a is None or b is None:
+        return True
+    scale = max(1.0, abs(a), abs(b))
+    return abs(a - b) <= 1.0e-9 * scale
+
+
+def csv_escape(value):
+    text = fmt_value(value)
+    needs_quote = ("," in text) or ("\"" in text) or ("\n" in text) or ("\r" in text)
+    text = text.replace("\"", "\"\"")
+    if needs_quote:
+        return "\"" + text + "\""
+    return text
+
+
+def csv_line(values):
+    return ",".join([csv_escape(v) for v in values])
+
+
+def ensure_dir(path):
+    if not System.IO.Directory.Exists(path):
+        System.IO.Directory.CreateDirectory(path)
+
+
+def sanitize_file_name(text):
+    text = safe_text(text).strip()
+    bad = System.IO.Path.GetInvalidFileNameChars()
+    for ch in bad:
+        text = text.replace(ch, "_")
+    text = re.sub(r"\s+", "_", text)
+    if not text:
+        text = "unnamed"
+    return text
+
+
+def sanitize_sheet_name(text, used):
+    text = safe_text(text).strip()
+    for ch in [":", "\\", "/", "?", "*", "[", "]"]:
+        text = text.replace(ch, "_")
+    if not text:
+        text = "Sheet"
+    text = text[:31]
+    base = text
+    idx = 1
+    while text.lower() in used:
+        suffix = "_" + safe_text(idx)
+        text = (base[:31 - len(suffix)] + suffix)
+        idx += 1
+    used.add(text.lower())
+    return text
+
+
+class LogBook(object):
+    def __init__(self):
+        self.lines = []
+        self.warnings = 0
+
+    def info(self, text):
+        self.lines.append("[INFO] " + safe_text(text))
+
+    def warn(self, text):
+        self.warnings += 1
+        self.lines.append("[WARN] " + safe_text(text))
+
+    def error(self, text):
+        self.lines.append("[ERROR] " + safe_text(text))
+
+
+class BoltEnvironment(object):
+    def __init__(self, owner):
+        self.owner = owner
+        self.owner_key = safe_object_id(owner)
+        self.name = safe_name(owner)
+        self.category = safe_category(owner)
+        self.individual = {}
+        self.screening = {}
+        self.individual_root = None
+        self.screening_root = None
+
+    def add_individual(self, udr):
+        expr = udr_expression(udr)
+        bolt = bolt_id_from_udr(udr)
+        if not expr or not bolt:
+            return
+        if bolt not in self.individual:
+            self.individual[bolt] = {}
+        self.individual[bolt][expr] = udr
+
+    def add_screening(self, udr):
+        expr = udr_expression(udr)
+        label = get_driver_label(udr)
+        if not expr or not label:
+            return
+        if expr not in self.screening:
+            self.screening[expr] = {}
+        self.screening[expr][label] = udr
+
+    def all_udrs(self):
+        objects = []
+        for bolt in sorted(self.individual.keys()):
+            for expr in EXPRESSIONS:
+                if expr in self.individual[bolt]:
+                    objects.append(self.individual[bolt][expr])
+        for expr in EXPRESSIONS:
+            if expr in self.screening:
+                for label in SCREENING_LABELS:
+                    if label in self.screening[expr]:
+                        objects.append(self.screening[expr][label])
+        return objects
+
+    def summary(self):
+        bolt_count = len(self.individual.keys())
+        ind_count = 0
+        for bolt in self.individual:
+            ind_count += len(self.individual[bolt].keys())
+        screen_count = 0
+        for expr in self.screening:
+            screen_count += len(self.screening[expr].keys())
+        return "{0} ({1}) - {2} bolts, {3} individual UDRs, {4} screening UDRs".format(
+            self.name, self.category, bolt_count, ind_count, screen_count
+        )
+
+    def detail(self):
+        lines = []
+        lines.append("Tree object: " + self.name)
+        lines.append("Type: " + self.category)
+        lines.append("Individual bolt IDs: " + ", ".join(sorted(self.individual.keys())))
+        lines.append("Individual UDRs: " + safe_text(sum([len(self.individual[b].keys()) for b in self.individual])))
+        lines.append("Screening UDRs: " + safe_text(sum([len(self.screening[e].keys()) for e in self.screening])))
+        if self.individual_root is not None:
+            lines.append("Individual root: " + tree_path(self.individual_root))
+        if self.screening_root is not None:
+            lines.append("Screening root: " + tree_path(self.screening_root))
+        missing = []
+        for bolt in sorted(self.individual.keys()):
+            for expr in EXPRESSIONS:
+                if expr not in self.individual[bolt]:
+                    missing.append("Bolt {0}: {1}".format(bolt, expr))
+        if missing:
+            lines.append("")
+            lines.append("Missing individual components:")
+            lines.extend(missing[:12])
+            if len(missing) > 12:
+                lines.append("... {0} more".format(len(missing) - 12))
+        return "\r\n".join(lines)
+
+
+def discover_environments(log):
+    envs_by_key = {}
+    folders = DataModel.GetObjectsByType(DataModelObjectCategory.TreeGroupingFolder)
+    for folder in folders:
+        folder_name = safe_name(folder)
+        if folder_name not in [INDIVIDUAL_ROOT, SCREENING_ROOT]:
+            continue
+        owner = owner_of(folder)
+        if owner is None:
+            continue
+        key = safe_object_id(owner)
+        if key not in envs_by_key:
+            envs_by_key[key] = BoltEnvironment(owner)
+        env = envs_by_key[key]
+        udrs = collect_udrs(folder)
+        if folder_name == INDIVIDUAL_ROOT:
+            env.individual_root = folder
+            for udr in udrs:
+                env.add_individual(udr)
+        elif folder_name == SCREENING_ROOT:
+            env.screening_root = folder
+            for udr in udrs:
+                env.add_screening(udr)
+
+    envs = []
+    for key in envs_by_key:
+        env = envs_by_key[key]
+        if len(env.individual.keys()) > 0 or len(env.screening.keys()) > 0:
+            envs.append(env)
+    envs.sort(key=lambda e: (e.category, e.name))
+    log.info("Discovered {0} bolt result environment(s).".format(len(envs)))
+    return envs
+
+
+def set_calculate_time_history(env, log):
+    for udr in env.all_udrs():
+        try:
+            current = bool(udr.CalculateTimeHistory)
+        except:
+            current = False
+        if current:
+            continue
+        try:
+            udr.CalculateTimeHistory = True
+            log.info("Set Calculate Time History = Yes on " + safe_name(udr))
+        except Exception as exc:
+            log.warn("Could not set Calculate Time History on {0}: {1}".format(safe_name(udr), safe_text(exc)))
+
+
+def capture_state(udr):
+    state = {}
+    for attr in ["By", "SetNumber", "CombinationNumber", "Time", "DisplayTime"]:
+        try:
+            state[attr] = getattr(udr, attr)
+        except:
+            pass
+    return state
+
+
+def restore_state(udr, state):
+    for attr in ["By", "SetNumber", "CombinationNumber", "Time", "DisplayTime"]:
+        if attr not in state:
+            continue
+        try:
+            setattr(udr, attr, state[attr])
+        except:
+            pass
+
+
+def get_analysis_steps(env, log):
+    steps = []
+    if env.category == "SolutionCombination":
+        count = 0
+        try:
+            count = int(env.owner.Definition.LoadCombinationCount)
+        except Exception as exc:
+            log.warn("Could not read load combination count for {0}: {1}".format(env.name, safe_text(exc)))
+        if count < 1:
+            count = 1
+        for i in range(count):
+            label = "Combination {0}".format(i)
+            try:
+                label = safe_text(env.owner.Definition.GetLoadCombinationName(i))
+            except:
+                pass
+            steps.append({"kind": "combination", "index": i, "label": label, "time": ""})
+        return steps
+
+    times = []
+    try:
+        data = env.owner.GetResultsData()
+        if data is not None:
+            try:
+                for t in data.ListTimeFreq:
+                    times.append(t)
+            finally:
+                try:
+                    data.Dispose()
+                except:
+                    pass
+    except Exception as exc:
+        log.warn("Could not read ListTimeFreq for {0}: {1}".format(env.name, safe_text(exc)))
+
+    if times:
+        for i, t in enumerate(times):
+            steps.append({"kind": "set", "index": i + 1, "label": "Set {0}".format(i + 1), "time": number_or_text(t)})
+    else:
+        steps.append({"kind": "current", "index": 0, "label": "Current", "time": ""})
+    return steps
+
+
+def apply_step(udr, env, step, log):
+    if env.category == "SolutionCombination":
+        try:
+            udr.CombinationNumber = int(step["index"])
+            return
+        except Exception as exc:
+            log.warn("Could not set CombinationNumber={0} on {1}: {2}".format(step["index"], safe_name(udr), safe_text(exc)))
+            return
+
+    if step["kind"] == "current":
+        return
+
+    if SetDriverStyle is not None:
+        try:
+            udr.By = SetDriverStyle.ResultSet
+        except:
+            pass
+    try:
+        udr.SetNumber = int(step["index"])
+    except:
+        try:
+            udr.SetNumber = int(step["index"]) - 1
+        except Exception as exc:
+            log.warn("Could not set result set {0} on {1}: {2}".format(step["index"], safe_name(udr), safe_text(exc)))
+
+
+def evaluate_result(udr, log):
+    try:
+        udr.EvaluateAllResults()
+    except Exception as exc:
+        log.warn("Evaluation warning for {0}: {1}".format(safe_name(udr), safe_text(exc)))
+
+
+def read_result_value(udr, log):
+    min_val = None
+    max_val = None
+    try:
+        min_val = first_number(udr.Minimum)
+    except:
+        pass
+    try:
+        max_val = first_number(udr.Maximum)
+    except:
+        pass
+    if min_val is None and max_val is None:
+        log.warn("No numeric Minimum/Maximum value found for " + safe_name(udr))
+        return "", ""
+    if min_val is None:
+        return max_val, ""
+    if max_val is None:
+        return min_val, ""
+    if approx_equal(min_val, max_val):
+        return max_val, ""
+    selected = max_val
+    if abs(min_val) > abs(max_val):
+        selected = min_val
+    note = "min/max differ for {0}; selected larger absolute value (min={1}, max={2})".format(
+        safe_name(udr), fmt_value(min_val), fmt_value(max_val)
+    )
+    log.warn(note)
+    return selected, note
+
+
+def extract_individual_rows(env, include_time_history, log):
+    steps = get_analysis_steps(env, log)
+    if not include_time_history and steps:
+        steps = [steps[-1]]
+    rows_by_bolt = {}
+    unit_by_expr = {}
+    states = {}
+    for udr in env.all_udrs():
+        states[safe_object_id(udr)] = (udr, capture_state(udr))
+
+    try:
+        for bolt in sorted(env.individual.keys()):
+            rows = []
+            expr_map = env.individual[bolt]
+            for step in steps:
+                row = {
+                    "environment": env.name,
+                    "environment_type": env.category,
+                    "bolt": bolt,
+                    "node_selection": "",
+                    "step_index": step["index"],
+                    "step_label": step["label"],
+                    "time": step["time"],
+                    "values": {},
+                    "notes": [],
+                }
+                for expr in EXPRESSIONS:
+                    if expr not in expr_map:
+                        row["values"][expr] = ""
+                        row["notes"].append("missing " + expr)
+                        continue
+                    udr = expr_map[expr]
+                    if not row["node_selection"]:
+                        row["node_selection"] = node_selection_name(udr)
+                    if expr not in unit_by_expr:
+                        unit_by_expr[expr] = result_unit(udr)
+                    apply_step(udr, env, step, log)
+                    evaluate_result(udr, log)
+                    value, note = read_result_value(udr, log)
+                    row["values"][expr] = value
+                    if note:
+                        row["notes"].append(note)
+                rows.append(row)
+            rows_by_bolt[bolt] = rows
+    finally:
+        for key in states:
+            obj, state = states[key]
+            restore_state(obj, state)
+
+    return rows_by_bolt, unit_by_expr
+
+
+def compute_screening(rows_by_bolt):
+    summaries = {}
+    for bolt in rows_by_bolt:
+        rows = rows_by_bolt[bolt]
+        summary = []
+        for expr in EXPRESSIONS:
+            values = []
+            for row in rows:
+                val = row["values"].get(expr, "")
+                if isinstance(val, float):
+                    values.append((val, row["time"], row["step_label"]))
+                else:
+                    num = first_number(val)
+                    if num is not None:
+                        values.append((num, row["time"], row["step_label"]))
+            if not values:
+                summary.append({
+                    "expression": expr,
+                    "max": "",
+                    "time_of_max": "",
+                    "min": "",
+                    "time_of_min": "",
+                    "max_step": "",
+                    "min_step": "",
+                })
+                continue
+            max_row = max(values, key=lambda x: x[0])
+            min_row = min(values, key=lambda x: x[0])
+            summary.append({
+                "expression": expr,
+                "max": max_row[0],
+                "time_of_max": max_row[1],
+                "max_step": max_row[2],
+                "min": min_row[0],
+                "time_of_min": min_row[1],
+                "min_step": min_row[2],
+            })
+        summaries[bolt] = summary
+    return summaries
+
+
+def extract_existing_screening(env, log):
+    rows = []
+    for expr in EXPRESSIONS:
+        if expr not in env.screening:
+            continue
+        for label in SCREENING_LABELS:
+            if label not in env.screening[expr]:
+                continue
+            udr = env.screening[expr][label]
+            evaluate_result(udr, log)
+            min_val = ""
+            max_val = ""
+            try:
+                min_val = number_or_text(udr.Minimum)
+            except:
+                pass
+            try:
+                max_val = number_or_text(udr.Maximum)
+            except:
+                pass
+            rows.append({
+                "environment": env.name,
+                "expression": expr,
+                "screening_result": label,
+                "source_udr": safe_name(udr),
+                "location": node_selection_name(udr),
+                "minimum": min_val,
+                "maximum": max_val,
+                "unit": result_unit(udr),
+            })
+    return rows
+
+
+def write_text_file(path, lines):
+    writer = System.IO.StreamWriter(path, False, System.Text.Encoding.UTF8)
+    try:
+        for line in lines:
+            writer.WriteLine(line)
+    finally:
+        writer.Close()
+
+
+def write_bolt_csv(path, env, bolt, rows, summary, unit_by_expr):
+    lines = []
+    lines.append("# Bolt ENFO/ENMO export")
+    lines.append("# Environment,{0}".format(csv_escape(env.name)))
+    lines.append("# Environment Type,{0}".format(csv_escape(env.category)))
+    lines.append("# Bolt,{0}".format(csv_escape(bolt)))
+    if rows:
+        lines.append("# Node Named Selection,{0}".format(csv_escape(rows[0]["node_selection"])))
+    lines.append("# Generated,{0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    lines.append("")
+    lines.append("Units")
+    lines.append(csv_line(["Expression", "Unit"]))
+    for expr in EXPRESSIONS:
+        lines.append(csv_line([expr, unit_by_expr.get(expr, "")]))
+    lines.append("")
+    lines.append("Time History")
+    header = ["StepIndex", "StepLabel", "Time", "NodeSelection"] + EXPRESSIONS + ["Notes"]
+    lines.append(csv_line(header))
+    for row in rows:
+        values = [row["step_index"], row["step_label"], row["time"], row["node_selection"]]
+        for expr in EXPRESSIONS:
+            values.append(row["values"].get(expr, ""))
+        values.append("; ".join(row["notes"]))
+        lines.append(csv_line(values))
+    lines.append("")
+    lines.append("Computed Screening Summary")
+    lines.append(csv_line(["Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"]))
+    for item in summary:
+        lines.append(csv_line([
+            item["expression"],
+            item["max"],
+            item["time_of_max"],
+            item["max_step"],
+            item["min"],
+            item["time_of_min"],
+            item["min_step"],
+        ]))
+    write_text_file(path, lines)
+
+
+def write_summary_csv(path, env, rows_by_bolt, summaries):
+    lines = []
+    lines.append(csv_line(["Environment", "Bolt", "Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"]))
+    for bolt in sorted(summaries.keys()):
+        for item in summaries[bolt]:
+            lines.append(csv_line([
+                env.name,
+                bolt,
+                item["expression"],
+                item["max"],
+                item["time_of_max"],
+                item["max_step"],
+                item["min"],
+                item["time_of_min"],
+                item["min_step"],
+            ]))
+    write_text_file(path, lines)
+
+
+def write_existing_screening_csv(path, rows):
+    lines = []
+    lines.append(csv_line(["Environment", "Expression", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"]))
+    for row in rows:
+        lines.append(csv_line([
+            row["environment"],
+            row["expression"],
+            row["screening_result"],
+            row["source_udr"],
+            row["location"],
+            row["minimum"],
+            row["maximum"],
+            row["unit"],
+        ]))
+    write_text_file(path, lines)
+
+
+def write_log(path, log):
+    write_text_file(path, log.lines)
+
+
+def set_cell(ws, row, col, value):
+    ws.Cells[row, col].Value2 = fmt_value(value)
+
+
+def write_table_to_sheet(ws, start_row, start_col, header, rows):
+    r = start_row
+    for c, value in enumerate(header):
+        set_cell(ws, r, start_col + c, value)
+    r += 1
+    for row in rows:
+        for c, value in enumerate(row):
+            set_cell(ws, r, start_col + c, value)
+        r += 1
+    return r
+
+
+def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, log):
+    excel_type = System.Type.GetTypeFromProgID("Excel.Application")
+    if excel_type is None:
+        raise Exception("Microsoft Excel COM automation is not available.")
+    excel = System.Activator.CreateInstance(excel_type)
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    wb = None
+    try:
+        wb = excel.Workbooks.Add()
+        while wb.Worksheets.Count > 1:
+            wb.Worksheets[1].Delete()
+        used_names = set()
+        ws = wb.Worksheets[1]
+        ws.Name = sanitize_sheet_name("Summary", used_names)
+
+        summary_rows = []
+        for bolt in sorted(summaries.keys()):
+            for item in summaries[bolt]:
+                summary_rows.append([
+                    env.name,
+                    bolt,
+                    item["expression"],
+                    item["max"],
+                    item["time_of_max"],
+                    item["max_step"],
+                    item["min"],
+                    item["time_of_min"],
+                    item["min_step"],
+                ])
+        write_table_to_sheet(ws, 1, 1, ["Environment", "Bolt", "Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"], summary_rows)
+        try:
+            ws.Columns.AutoFit()
+        except:
+            pass
+
+        for bolt in sorted(rows_by_bolt.keys()):
+            ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+            ws.Name = sanitize_sheet_name("Bolt_" + bolt, used_names)
+            set_cell(ws, 1, 1, "Environment")
+            set_cell(ws, 1, 2, env.name)
+            set_cell(ws, 2, 1, "Bolt")
+            set_cell(ws, 2, 2, bolt)
+            set_cell(ws, 3, 1, "Generated")
+            set_cell(ws, 3, 2, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            unit_rows = []
+            for expr in EXPRESSIONS:
+                unit_rows.append([expr, unit_by_expr.get(expr, "")])
+            next_row = write_table_to_sheet(ws, 5, 1, ["Expression", "Unit"], unit_rows)
+            next_row += 2
+            hist_rows = []
+            for row in rows_by_bolt[bolt]:
+                hist = [row["step_index"], row["step_label"], row["time"], row["node_selection"]]
+                for expr in EXPRESSIONS:
+                    hist.append(row["values"].get(expr, ""))
+                hist.append("; ".join(row["notes"]))
+                hist_rows.append(hist)
+            next_row = write_table_to_sheet(ws, next_row, 1, ["StepIndex", "StepLabel", "Time", "NodeSelection"] + EXPRESSIONS + ["Notes"], hist_rows)
+            next_row += 2
+            screen_rows = []
+            for item in summaries[bolt]:
+                screen_rows.append([
+                    item["expression"],
+                    item["max"],
+                    item["time_of_max"],
+                    item["max_step"],
+                    item["min"],
+                    item["time_of_min"],
+                    item["min_step"],
+                ])
+            write_table_to_sheet(ws, next_row, 1, ["Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"], screen_rows)
+            try:
+                ws.Columns.AutoFit()
+            except:
+                pass
+
+        if existing_screening:
+            ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+            ws.Name = sanitize_sheet_name("Existing_Screening", used_names)
+            data_rows = []
+            for row in existing_screening:
+                data_rows.append([
+                    row["environment"],
+                    row["expression"],
+                    row["screening_result"],
+                    row["source_udr"],
+                    row["location"],
+                    row["minimum"],
+                    row["maximum"],
+                    row["unit"],
+                ])
+            write_table_to_sheet(ws, 1, 1, ["Environment", "Expression", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"], data_rows)
+            try:
+                ws.Columns.AutoFit()
+            except:
+                pass
+
+        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws.Name = sanitize_sheet_name("Log", used_names)
+        for i, line in enumerate(log.lines):
+            set_cell(ws, i + 1, 1, line)
+        try:
+            ws.Columns.AutoFit()
+        except:
+            pass
+
+        wb.SaveAs(path, 51)
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(False)
+            except:
+                pass
+        try:
+            excel.Quit()
+        except:
+            pass
+
+
+def default_output_folder():
+    try:
+        project_dir = safe_text(ExtAPI.DataModel.Project.ProjectDirectory)
+        if project_dir and System.IO.Directory.Exists(project_dir):
+            return System.IO.Path.Combine(project_dir, "bolt_result_exports")
+    except:
+        pass
+    desktop = System.Environment.GetFolderPath(System.Environment.SpecialFolder.Desktop)
+    return System.IO.Path.Combine(desktop, "bolt_result_exports")
+
+
+class ExportOptionsForm(Form):
+    def __init__(self, environments):
+        self.environments = environments
+        self.selected_environment = None
+        self.output_folder = default_output_folder()
+        self.output_excel = False
+        self.include_time_history = True
+        self.include_existing_screening = True
+
+        self.Text = "Bolt ENFO/ENMO Result Exporter"
+        self.Size = Size(820, 610)
+        self.MinimumSize = Size(760, 560)
+        self.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+
+        title = Label()
+        title.Text = "Select the analysis or solution combination to export"
+        title.Location = Point(14, 14)
+        title.Size = Size(760, 22)
+        self.Controls.Add(title)
+
+        self.combo = ComboBox()
+        self.combo.Location = Point(14, 42)
+        self.combo.Size = Size(775, 26)
+        self.combo.DropDownStyle = ComboBoxStyle.DropDownList
+        for env in environments:
+            self.combo.Items.Add(env.summary())
+        if len(environments) > 0:
+            self.combo.SelectedIndex = 0
+        self.combo.SelectedIndexChanged += self.on_selection_changed
+        self.Controls.Add(self.combo)
+
+        self.detail = TextBox()
+        self.detail.Location = Point(14, 78)
+        self.detail.Size = Size(775, 130)
+        self.detail.Multiline = True
+        self.detail.ReadOnly = True
+        self.detail.ScrollBars = ScrollBars.Vertical
+        self.detail.BorderStyle = BorderStyle.FixedSingle
+        self.Controls.Add(self.detail)
+
+        out_group = GroupBox()
+        out_group.Text = "Output"
+        out_group.Location = Point(14, 220)
+        out_group.Size = Size(775, 110)
+        self.Controls.Add(out_group)
+
+        out_label = Label()
+        out_label.Text = "Folder"
+        out_label.Location = Point(12, 27)
+        out_label.Size = Size(60, 20)
+        out_group.Controls.Add(out_label)
+
+        self.folder_box = TextBox()
+        self.folder_box.Location = Point(72, 24)
+        self.folder_box.Size = Size(585, 24)
+        self.folder_box.Text = self.output_folder
+        out_group.Controls.Add(self.folder_box)
+
+        browse = Button()
+        browse.Text = "Browse..."
+        browse.Location = Point(665, 22)
+        browse.Size = Size(90, 28)
+        browse.Click += self.on_browse
+        out_group.Controls.Add(browse)
+
+        self.csv_radio = RadioButton()
+        self.csv_radio.Text = "CSV folder: one file per bolt plus summary files"
+        self.csv_radio.Location = Point(72, 60)
+        self.csv_radio.Size = Size(330, 24)
+        self.csv_radio.Checked = True
+        out_group.Controls.Add(self.csv_radio)
+
+        self.xlsx_radio = RadioButton()
+        self.xlsx_radio.Text = "Excel workbook: one sheet per bolt (requires Microsoft Excel)"
+        self.xlsx_radio.Location = Point(410, 60)
+        self.xlsx_radio.Size = Size(350, 24)
+        out_group.Controls.Add(self.xlsx_radio)
+
+        opt_group = GroupBox()
+        opt_group.Text = "Extraction"
+        opt_group.Location = Point(14, 342)
+        opt_group.Size = Size(775, 92)
+        self.Controls.Add(opt_group)
+
+        self.history_check = CheckBox()
+        self.history_check.Text = "Export all result sets/time points when available"
+        self.history_check.Location = Point(18, 28)
+        self.history_check.Size = Size(360, 24)
+        self.history_check.Checked = True
+        opt_group.Controls.Add(self.history_check)
+
+        self.screening_check = CheckBox()
+        self.screening_check.Text = "Also export existing Max/Min Screening UDR values"
+        self.screening_check.Location = Point(18, 56)
+        self.screening_check.Size = Size(400, 24)
+        self.screening_check.Checked = True
+        opt_group.Controls.Add(self.screening_check)
+
+        note = Label()
+        note.Text = "The script also computes per-bolt max/min summaries from the individual bolt time-history rows."
+        note.Location = Point(430, 30)
+        note.Size = Size(330, 40)
+        opt_group.Controls.Add(note)
+
+        self.warning = TextBox()
+        self.warning.Location = Point(14, 446)
+        self.warning.Size = Size(775, 68)
+        self.warning.Multiline = True
+        self.warning.ReadOnly = True
+        self.warning.BorderStyle = BorderStyle.FixedSingle
+        self.warning.Text = "This script changes Calculate Time History to Yes on the selected bolt UDRs when the property is writable. It does not save the project automatically."
+        self.Controls.Add(self.warning)
+
+        ok = Button()
+        ok.Text = "Export"
+        ok.Location = Point(598, 526)
+        ok.Size = Size(90, 30)
+        ok.Click += self.on_export
+        self.Controls.Add(ok)
+
+        cancel = Button()
+        cancel.Text = "Cancel"
+        cancel.Location = Point(698, 526)
+        cancel.Size = Size(90, 30)
+        cancel.Click += self.on_cancel
+        self.Controls.Add(cancel)
+
+        self.AcceptButton = ok
+        self.CancelButton = cancel
+        self.on_selection_changed(None, None)
+
+    def on_selection_changed(self, sender, args):
+        idx = self.combo.SelectedIndex
+        if idx >= 0 and idx < len(self.environments):
+            self.detail.Text = self.environments[idx].detail()
+
+    def on_browse(self, sender, args):
+        dlg = FolderBrowserDialog()
+        dlg.Description = "Choose the parent output folder"
+        dlg.SelectedPath = self.folder_box.Text
+        if dlg.ShowDialog() == DialogResult.OK:
+            self.folder_box.Text = dlg.SelectedPath
+
+    def on_export(self, sender, args):
+        idx = self.combo.SelectedIndex
+        if idx < 0 or idx >= len(self.environments):
+            MessageBox.Show("Select an environment first.", "Bolt Export", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return
+        folder = self.folder_box.Text.strip()
+        if not folder:
+            MessageBox.Show("Choose an output folder.", "Bolt Export", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return
+        self.selected_environment = self.environments[idx]
+        self.output_folder = folder
+        self.output_excel = bool(self.xlsx_radio.Checked)
+        self.include_time_history = bool(self.history_check.Checked)
+        self.include_existing_screening = bool(self.screening_check.Checked)
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def on_cancel(self, sender, args):
+        self.DialogResult = DialogResult.Cancel
+        self.Close()
+
+
+def run_export(env, parent_folder, output_excel, include_time_history, include_existing_screening, log):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_env = sanitize_file_name(env.name)
+    export_dir = System.IO.Path.Combine(parent_folder, "bolt_export_{0}_{1}".format(safe_env, timestamp))
+    ensure_dir(export_dir)
+    log.info("Output directory: " + export_dir)
+    log.info("Selected environment: " + env.summary())
+
+    set_calculate_time_history(env, log)
+    rows_by_bolt, unit_by_expr = extract_individual_rows(env, include_time_history, log)
+    summaries = compute_screening(rows_by_bolt)
+    existing_screening = []
+    if include_existing_screening:
+        existing_screening = extract_existing_screening(env, log)
+
+    if output_excel:
+        workbook = System.IO.Path.Combine(export_dir, "bolt_results_{0}.xlsx".format(safe_env))
+        try:
+            write_excel(workbook, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, log)
+            log.info("Wrote Excel workbook: " + workbook)
+        except Exception as exc:
+            log.warn("Excel export failed; writing CSV fallback. Reason: " + safe_text(exc))
+            output_excel = False
+
+    if not output_excel:
+        for bolt in sorted(rows_by_bolt.keys()):
+            path = System.IO.Path.Combine(export_dir, "bolt_{0}.csv".format(sanitize_file_name(bolt)))
+            write_bolt_csv(path, env, bolt, rows_by_bolt[bolt], summaries.get(bolt, []), unit_by_expr)
+            log.info("Wrote " + path)
+        write_summary_csv(System.IO.Path.Combine(export_dir, "computed_screening_summary.csv"), env, rows_by_bolt, summaries)
+        if include_existing_screening:
+            write_existing_screening_csv(System.IO.Path.Combine(export_dir, "existing_screening_udr_values.csv"), existing_screening)
+
+    write_log(System.IO.Path.Combine(export_dir, "export_log.txt"), log)
+    return export_dir, len(rows_by_bolt.keys()), log.warnings
+
+
+def main():
+    log = LogBook()
+    try:
+        envs = discover_environments(log)
+        if not envs:
+            MessageBox.Show(
+                "No bolt ENFO/ENMO result folders were found. Expected folders named 'Bolt Results' or 'Bolt Results - Max/Min Screening'.",
+                "Bolt Export",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning,
+            )
+            return
+
+        form = ExportOptionsForm(envs)
+        if form.ShowDialog() != DialogResult.OK:
+            return
+
+        export_dir, bolt_count, warnings = run_export(
+            form.selected_environment,
+            form.output_folder,
+            form.output_excel,
+            form.include_time_history,
+            form.include_existing_screening,
+            log,
+        )
+
+        MessageBox.Show(
+            "Export complete.\n\nFolder:\n{0}\n\nBolts exported: {1}\nWarnings: {2}".format(export_dir, bolt_count, warnings),
+            "Bolt Export",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information,
+        )
+    except Exception as exc:
+        detail = traceback.format_exc()
+        try:
+            fallback = default_output_folder()
+            ensure_dir(fallback)
+            write_text_file(System.IO.Path.Combine(fallback, "bolt_export_error.txt"), [safe_text(detail)])
+        except:
+            pass
+        MessageBox.Show(
+            "Bolt export failed:\n\n{0}\n\nDetails:\n{1}".format(safe_text(exc), safe_text(detail)),
+            "Bolt Export",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Error,
+        )
+
+
+main()

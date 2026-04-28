@@ -1,5 +1,5 @@
 # IronPython script for ANSYS Mechanical (tested syntax style for 2023R2+)
-# --- MODIFIED: multi-folder grouping + optional max/min screening mode ---
+# --- MODIFIED: multi-folder grouping + optional max/min/resultant screening mode ---
 
 import clr
 clr.AddReference("System.Windows.Forms")
@@ -12,6 +12,24 @@ from System.Windows.Forms import (
 from System.Drawing import Point, Size
 
 EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ", "ENMOX", "ENMOY", "ENMOZ"]
+FORCE_EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ"]
+MOMENT_EXPRESSIONS = ["ENMOX", "ENMOY", "ENMOZ"]
+SCREEN_RESULTANTS = [
+    {
+        "name": "ENFO_Resultant",
+        "expression": "sqrt(ENFOX^2 + ENFOY^2 + ENFOZ^2)",
+        "components": FORCE_EXPRESSIONS
+    },
+    {
+        "name": "ENMO_Resultant",
+        "expression": "sqrt(ENMOX^2 + ENMOY^2 + ENMOZ^2)",
+        "components": MOMENT_EXPRESSIONS
+    }
+]
+SCREEN_POSSIBLE_RESULTANT_LABEL = "Possible Resultant Maximum of Combination"
+SCREEN_COMPONENT_ENVELOPE_LABEL = "Combination of Maximum Results"
+SCREEN_MAX_DRIVER = 3
+SCREEN_MIN_DRIVER = 12
 
 # --- NEW: parent folder names ---
 HISTORY_PARENT_SINGLE = "Bolt Results"
@@ -226,6 +244,101 @@ def make_unique_name(base_name, used_names):
     return name
 
 
+def _is_identifier_letter(ch):
+    return ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+
+
+def _is_identifier_digit(ch):
+    return "0" <= ch <= "9"
+
+
+def make_safe_identifier(base_name, used_identifiers):
+    try:
+        text = str(base_name)
+    except:
+        text = "UDR"
+
+    chars = []
+    last_underscore = False
+    for ch in text:
+        if _is_identifier_letter(ch) or _is_identifier_digit(ch) or ch == "_":
+            chars.append(ch)
+            last_underscore = False
+        else:
+            if not last_underscore:
+                chars.append("_")
+                last_underscore = True
+
+    identifier = "".join(chars).strip("_")
+    if len(identifier) == 0:
+        identifier = "UDR"
+
+    if not (_is_identifier_letter(identifier[0]) or identifier[0] == "_"):
+        identifier = "UDR_" + identifier
+
+    if len(identifier) > 120:
+        identifier = identifier[:120].rstrip("_")
+
+    base_identifier = identifier
+    i = 1
+    while identifier.lower() in used_identifiers:
+        suffix = "_{}".format(i)
+        identifier = "{}{}".format(base_identifier[:120 - len(suffix)].rstrip("_"), suffix)
+        i += 1
+
+    used_identifiers.add(identifier.lower())
+    return identifier
+
+
+def _object_key(obj):
+    try:
+        return obj.ObjectId
+    except:
+        pass
+    try:
+        return obj.Name
+    except:
+        return str(obj)
+
+
+def _identifier_scope_token(ns):
+    try:
+        return "NS{}".format(ns.ObjectId)
+    except:
+        pass
+    try:
+        return ns.Name
+    except:
+        return "NS"
+
+
+def _try_set_identifier(udr, identifier):
+    try:
+        udr.Identifier = identifier
+        return True
+    except:
+        pass
+
+    try:
+        prop = udr.PropertyByName("Identifier")
+        prop.InternalValue = identifier
+        return True
+    except:
+        pass
+
+    try:
+        prop = udr.PropertyByName("Identifier")
+        prop.Value = identifier
+        return True
+    except:
+        return False
+
+
+def _screening_identifier(expr, ns, suffix, used_identifiers):
+    base = "BOLT_{0}_{1}_{2}".format(expr, _identifier_scope_token(ns), suffix)
+    return make_safe_identifier(base, used_identifiers)
+
+
 def _safe_count_ids(ids_obj):
     if ids_obj is None:
         return None
@@ -361,8 +474,13 @@ def run():
 
     failed_scopes = []
     failed_setdrivers = []
+    failed_identifiers = []
+    failed_resultant_dependencies = []
     used_names = set()
+    used_identifiers = set()
+    component_extreme_identifiers = {}
     created_count = 0
+    expression_group_count = 0
 
     # --- MODIFIED: parent folder naming logic ---
     parent_name = None
@@ -388,6 +506,12 @@ def run():
             #         ...
             #     ENFOY
             #       ...
+            #     ENFO_Resultant
+            #       <NS1>
+            #         Possible Resultant Maximum of Combination
+            #         Combination of Maximum Results
+            #     ENMO_Resultant
+            #       ...
             # =========================
             for expr in EXPRESSIONS:
                 ns_group_folders = []
@@ -409,6 +533,20 @@ def run():
                         if not _try_set_setdriver(udr, drv_val):
                             failed_setdrivers.append(udr.Name)
 
+                        if drv_val == SCREEN_MAX_DRIVER:
+                            identifier = _screening_identifier(expr, ns, "MAX", used_identifiers)
+                            if _try_set_identifier(udr, identifier):
+                                component_extreme_identifiers[(_object_key(ns), expr, SCREEN_MAX_DRIVER)] = identifier
+                            else:
+                                failed_identifiers.append(udr.Name)
+
+                        elif drv_val == SCREEN_MIN_DRIVER:
+                            identifier = _screening_identifier(expr, ns, "MIN", used_identifiers)
+                            if _try_set_identifier(udr, identifier):
+                                component_extreme_identifiers[(_object_key(ns), expr, SCREEN_MIN_DRIVER)] = identifier
+                            else:
+                                failed_identifiers.append(udr.Name)
+
                         ns_udrs.append(udr)
                         created_count += 1
 
@@ -421,8 +559,74 @@ def run():
                 expr_folder.Name = expr
                 expr_folders.append(expr_folder)
 
+            for resultant_def in SCREEN_RESULTANTS:
+                ns_group_folders = []
+
+                for ns in all_named_selections:
+                    ns_udrs = []
+
+                    possible_udr = solution.AddUserDefinedResult()
+                    possible_udr.Expression = resultant_def["expression"]
+                    possible_base = "{0}_{1}_{2}".format(
+                        resultant_def["name"],
+                        ns.Name,
+                        SCREEN_POSSIBLE_RESULTANT_LABEL.replace(" ", "")
+                    )
+                    possible_udr.Name = make_unique_name(possible_base, used_names)
+
+                    if not scope_udr_to_named_selection(possible_udr, ns):
+                        failed_scopes.append(possible_udr.Name)
+
+                    if not _try_set_setdriver(possible_udr, SCREEN_MAX_DRIVER):
+                        failed_setdrivers.append(possible_udr.Name)
+
+                    ns_udrs.append(possible_udr)
+                    created_count += 1
+
+                    component_terms = []
+                    missing_dependency = False
+                    ns_key = _object_key(ns)
+                    for component_expr in resultant_def["components"]:
+                        max_identifier = component_extreme_identifiers.get((ns_key, component_expr, SCREEN_MAX_DRIVER), None)
+                        min_identifier = component_extreme_identifiers.get((ns_key, component_expr, SCREEN_MIN_DRIVER), None)
+                        if max_identifier is None or min_identifier is None:
+                            missing_dependency = True
+                            break
+                        component_terms.append("max(abs({0}), abs({1}))".format(max_identifier, min_identifier))
+
+                    if missing_dependency:
+                        failed_resultant_dependencies.append("{0}_{1}".format(resultant_def["name"], ns.Name))
+                    else:
+                        envelope_udr = solution.AddUserDefinedResult()
+                        envelope_udr.Expression = "sqrt({0}^2 + {1}^2 + {2}^2)".format(
+                            component_terms[0],
+                            component_terms[1],
+                            component_terms[2]
+                        )
+                        envelope_base = "{0}_{1}_{2}".format(
+                            resultant_def["name"],
+                            ns.Name,
+                            SCREEN_COMPONENT_ENVELOPE_LABEL.replace(" ", "")
+                        )
+                        envelope_udr.Name = make_unique_name(envelope_base, used_names)
+
+                        if not scope_udr_to_named_selection(envelope_udr, ns):
+                            failed_scopes.append(envelope_udr.Name)
+
+                        ns_udrs.append(envelope_udr)
+                        created_count += 1
+
+                    ns_folder = tree.Group(ns_udrs)
+                    ns_folder.Name = ns.Name
+                    ns_group_folders.append(ns_folder)
+
+                resultant_folder = tree.Group(ns_group_folders)
+                resultant_folder.Name = resultant_def["name"]
+                expr_folders.append(resultant_folder)
+
             top_folder = tree.Group(expr_folders)
             top_folder.Name = parent_name
+            expression_group_count = len(expr_folders)
 
         else:
             # =========================
@@ -496,6 +700,7 @@ def run():
 
             top_folder = tree.Group(expr_folders)
             top_folder.Name = parent_name
+            expression_group_count = len(expr_folders)
 
     # --- MODIFIED: clearer summary (mode + folder naming) ---
     mode_txt = "Max/Min Screening" if use_screening else "History Data"
@@ -514,7 +719,7 @@ def run():
         target_env_kind,
         target_env_name,
         len(all_named_selections),
-        len(EXPRESSIONS),
+        expression_group_count,
         parent_name
     )
 
@@ -523,6 +728,12 @@ def run():
 
     if len(failed_setdrivers) > 0:
         msg += "\n\nWarning: {} screening result(s) could not set SetDriver.".format(len(failed_setdrivers))
+
+    if len(failed_identifiers) > 0:
+        msg += "\n\nWarning: {} screening result(s) could not set Identifier, so dependent resultant checks may be incomplete.".format(len(failed_identifiers))
+
+    if len(failed_resultant_dependencies) > 0:
+        msg += "\n\nWarning: {} combination-of-maximum resultant result(s) were skipped because component max/min identifiers were not available.".format(len(failed_resultant_dependencies))
 
     MessageBox.Show(msg, "Bolt UDR Generator", MessageBoxButtons.OK, MessageBoxIcon.Information)
 

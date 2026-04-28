@@ -36,6 +36,7 @@ from System.Windows.Forms import (
     MessageBox,
     MessageBoxButtons,
     MessageBoxIcon,
+    ProgressBar,
     RadioButton,
     ScrollBars,
     TextBox,
@@ -43,6 +44,11 @@ from System.Windows.Forms import (
 )
 
 from Ansys.Mechanical.DataModel.Enums import DataModelObjectCategory
+
+try:
+    from Ansys.ACT.Interfaces.Mechanical import MechanicalPanelEnum
+except:
+    pass
 
 try:
     from Ansys.Mechanical.DataModel.Enums import SetDriverStyle
@@ -82,6 +88,11 @@ SCREENING_DRIVER_TO_LABEL = {
     "TimeOfMinimum": "TimeOfMinimum",
     "Time Of Minimum": "TimeOfMinimum",
 }
+TABULAR_TIME_KEYS = ["Time", "Time [s]", "Time (s)", "Time [sec]", "Time (sec)", "Frequency", "Freq"]
+TABULAR_COMBINATION_KEYS = ["Combination", "Load Combination", "LoadCombination", "Combination Number"]
+TABULAR_MIN_KEYS = ["Minimum", "Min", "Minimum Value"]
+TABULAR_MAX_KEYS = ["Maximum", "Max", "Maximum Value"]
+TABULAR_AVG_KEYS = ["Average", "Avg", "Average Value"]
 
 
 def safe_text(value):
@@ -360,6 +371,32 @@ def attach_tip(tip, control, text):
         pass
 
 
+def report_progress(progress, percent, status, detail=""):
+    if progress is None:
+        return
+    try:
+        progress.update(percent, status, detail)
+    except:
+        pass
+    check_cancel(progress)
+
+
+def check_cancel(progress):
+    if progress is None:
+        return
+    try:
+        Application.DoEvents()
+    except:
+        pass
+    try:
+        if bool(progress.cancel_requested):
+            raise ExportCancelledException("Export cancelled by user.")
+    except ExportCancelledException:
+        raise
+    except:
+        pass
+
+
 def sanitize_file_name(text):
     text = safe_text(text).strip()
     bad = System.IO.Path.GetInvalidFileNameChars()
@@ -392,6 +429,22 @@ class LogBook(object):
     def __init__(self):
         self.lines = []
         self.warnings = 0
+        self.tabular_prepared = 0
+        self.tabular_hits = 0
+        self.tabular_fallbacks = 0
+        self.tabular_pane_prepared = 0
+        self.tabular_pane_hits = 0
+        self.tabular_pane_fallbacks = 0
+        self.plotdata_prepared = 0
+        self.plotdata_hits = 0
+        self.plotdata_fallbacks = 0
+        self.dpf_prepared = 0
+        self.dpf_hits = 0
+        self.dpf_fallbacks = 0
+        self.dpf_joint_hits = 0
+        self.dpf_joint_fallbacks = 0
+        self.dpf_joint_node_misses = 0
+        self.dpf_disabled_ops = []
 
     def info(self, text):
         self.lines.append("[INFO] " + safe_text(text))
@@ -402,6 +455,10 @@ class LogBook(object):
 
     def error(self, text):
         self.lines.append("[ERROR] " + safe_text(text))
+
+
+class ExportCancelledException(Exception):
+    pass
 
 
 class BoltEnvironment(object):
@@ -674,6 +731,1281 @@ def evaluate_result(udr, log):
         log.warn("Evaluation warning for {0}: {1}".format(safe_name(udr), safe_text(exc)))
 
 
+def individual_udrs(env):
+    found = []
+    seen = {}
+    for bolt in env.individual:
+        for expr in env.individual[bolt]:
+            udr = env.individual[bolt][expr]
+            key = safe_object_id(udr)
+            if key in seen:
+                continue
+            seen[key] = True
+            found.append(udr)
+    return found
+
+
+def prepare_plotdata_beta(env, log, progress, start_percent, end_percent):
+    udrs = individual_udrs(env)
+    total = len(udrs)
+    if total < 1:
+        return
+    log.info("PlotData beta requested. The exporter will evaluate each individual UDR once, try PlotData['Values'] while stepping result sets, then fall back to scalar UDR evaluation where needed.")
+    if env.category == "SolutionCombination":
+        log.warn("PlotData beta is experimental for solution combinations. If load-combination PlotData is unavailable or stale, affected values fall back to scalar UDR evaluation.")
+    report_progress(progress, start_percent, "Preparing PlotData beta cache", "Evaluating {0} individual UDR(s) once before PlotData reads.".format(total))
+    span = float(end_percent - start_percent)
+    prepared = 0
+    for i, udr in enumerate(udrs):
+        check_cancel(progress)
+        try:
+            udr.EvaluateAllResults()
+            prepared += 1
+            log.plotdata_prepared += 1
+        except Exception as exc:
+            log.info("PlotData beta preparation failed for {0}: {1}".format(safe_name(udr), safe_text(exc)))
+        pct = start_percent + int(span * float(i + 1) / float(max(1, total)))
+        report_progress(progress, pct, "Preparing PlotData beta cache", "{0} ({1}/{2})".format(safe_name(udr), i + 1, total))
+    if prepared < 1:
+        log.warn("PlotData beta preparation did not succeed for any individual UDR. The exporter will use scalar fallback where PlotData cannot be read.")
+    else:
+        log.info("PlotData beta prepared {0}/{1} individual UDR(s).".format(prepared, total))
+
+
+def list_values(series):
+    values = []
+    try:
+        count = int(len(series))
+        for i in range(count):
+            values.append(series[i])
+        return values
+    except:
+        pass
+    try:
+        count = int(series.Count)
+        for i in range(count):
+            values.append(series[i])
+        return values
+    except:
+        pass
+    try:
+        for item in series:
+            values.append(item)
+    except:
+        pass
+    return values
+
+
+def plotdata_column(plot_data, keys):
+    for key in keys:
+        try:
+            return plot_data[key]
+        except:
+            pass
+    try:
+        dependents = plot_data.Dependents
+        for key in keys:
+            try:
+                return dependents[key]
+            except:
+                pass
+    except:
+        pass
+    try:
+        independents = plot_data.Independents
+        for key in keys:
+            try:
+                return independents[key]
+            except:
+                pass
+    except:
+        pass
+    return None
+
+
+def read_plotdata_value(udr):
+    try:
+        plot_data = udr.PlotData
+    except Exception as exc:
+        return None, "PlotData unavailable: " + safe_text(exc)
+    if plot_data is None:
+        return None, "PlotData unavailable: result table is empty"
+    keys = ["Values", "Value", udr_expression(udr), safe_name(udr)]
+    values_column = plotdata_column(plot_data, keys)
+    if values_column is None:
+        return None, "PlotData has no readable Values column"
+    raw_values = list_values(values_column)
+    numeric_values = []
+    for raw in raw_values:
+        num = first_number(raw)
+        if num is not None:
+            numeric_values.append(num)
+    if not numeric_values:
+        return None, "PlotData Values column has no numeric rows"
+    if len(numeric_values) == 1:
+        return numeric_values[0], ""
+    min_val = min(numeric_values)
+    max_val = max(numeric_values)
+    if approx_equal(min_val, max_val):
+        return max_val, ""
+    selected = max_val
+    if abs(min_val) > abs(max_val):
+        selected = min_val
+    note = "PlotData beta selected larger absolute value from {0} table values (min={1}, max={2})".format(
+        len(numeric_values), fmt_value(min_val), fmt_value(max_val)
+    )
+    return selected, note
+
+
+def normalize_column_label(text):
+    text = safe_text(text).lower()
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r"\([^\)]*\)", "", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def plotdata_collection_keys(collection):
+    keys = []
+    for attr in ["Keys", "ColumnNames", "Names"]:
+        try:
+            raw_keys = getattr(collection, attr)
+            try:
+                raw_keys = raw_keys()
+            except:
+                pass
+            for item in list_values(raw_keys):
+                text = safe_text(item)
+                if text and text not in keys:
+                    keys.append(text)
+        except:
+            pass
+    try:
+        for item in collection:
+            text = safe_text(item)
+            if text and text not in keys:
+                keys.append(text)
+    except:
+        pass
+    return keys
+
+
+def plotdata_named_collections(plot_data):
+    collections = []
+    try:
+        collections.append(plot_data.Dependents)
+    except:
+        pass
+    try:
+        collections.append(plot_data.Independents)
+    except:
+        pass
+    return collections
+
+
+def plotdata_column_loose(plot_data, keys):
+    column = plotdata_column(plot_data, keys)
+    if column is not None:
+        return column
+    normalized = {}
+    for key in keys:
+        normalized[normalize_column_label(key)] = True
+    for collection in plotdata_named_collections(plot_data):
+        for name in plotdata_collection_keys(collection):
+            if normalize_column_label(name) not in normalized:
+                continue
+            try:
+                return collection[name]
+            except:
+                pass
+            try:
+                return plot_data[name]
+            except:
+                pass
+    return None
+
+
+def column_values(column):
+    if column is None:
+        return []
+    return list_values(column)
+
+
+def numeric_column_values(column):
+    values = []
+    for raw in column_values(column):
+        values.append(first_number(raw))
+    return values
+
+
+def value_at(values, index):
+    try:
+        if index >= 0 and index < len(values):
+            return values[index]
+    except:
+        pass
+    return None
+
+
+def step_key(step):
+    return safe_text(step.get("kind", "")) + ":" + safe_text(step.get("index", ""))
+
+
+def tabular_numeric_key(value):
+    num = first_number(value)
+    if num is None:
+        return None
+    try:
+        return "{0:.15g}".format(float(num))
+    except:
+        return safe_text(num).strip().lower()
+
+
+def build_tabular_time_lookup(time_values):
+    lookup = {}
+    for i, raw in enumerate(time_values):
+        key = tabular_numeric_key(raw)
+        if key is not None and key not in lookup:
+            lookup[key] = i
+    return lookup
+
+
+def build_tabular_label_lookup(values):
+    lookup = {}
+    for i, raw in enumerate(values):
+        raw_text = safe_text(raw).strip().lower()
+        if raw_text and raw_text not in lookup:
+            lookup[raw_text] = i
+        normalized = normalize_column_label(raw)
+        if normalized and normalized not in lookup:
+            lookup[normalized] = i
+    return lookup
+
+
+def find_matching_time_index(time_values, target, lookup=None):
+    target_num = first_number(target)
+    if target_num is not None and lookup is not None:
+        key = tabular_numeric_key(target_num)
+        if key in lookup:
+            return lookup[key]
+    for i, raw in enumerate(time_values):
+        num = first_number(raw)
+        if num is not None and approx_equal(num, target_num):
+            return i
+    return None
+
+
+def find_matching_label_index(values, label, lookup=None):
+    target = safe_text(label).strip().lower()
+    if not target:
+        return None
+    if lookup is not None:
+        normalized = normalize_column_label(target)
+        if normalized and normalized in lookup:
+            return lookup[normalized]
+        if target in lookup:
+            return lookup[target]
+    for i, raw in enumerate(values):
+        text = safe_text(raw).strip().lower()
+        if text == target or text in target or target in text:
+            return i
+    return None
+
+
+def tabular_row_index_for_step(step, row_count, time_values, combination_values, time_lookup=None, combination_lookup=None):
+    if row_count < 1:
+        return None
+    kind = safe_text(step.get("kind", ""))
+    if kind == "set":
+        target_time = step.get("time", "")
+        idx = find_matching_time_index(time_values, target_time, time_lookup)
+        if idx is not None and idx >= 0 and idx < row_count:
+            return idx
+        try:
+            idx = int(step.get("index", 0)) - 1
+            if idx >= 0 and idx < row_count:
+                target_num = first_number(target_time)
+                row_num = first_number(value_at(time_values, idx))
+                if target_num is None or row_num is None or approx_equal(row_num, target_num):
+                    return idx
+        except:
+            pass
+        idx = find_matching_time_index(time_values, target_time)
+        if idx is not None and idx >= 0 and idx < row_count:
+            return idx
+        try:
+            idx = int(step.get("index", 0)) - 1
+            if idx >= 0 and idx < row_count:
+                return idx
+        except:
+            pass
+        return None
+    if kind == "combination":
+        target_label = step.get("label", "")
+        idx = find_matching_label_index(combination_values, target_label, combination_lookup)
+        if idx is not None and idx >= 0 and idx < row_count:
+            return idx
+        try:
+            idx = int(step.get("index", 0))
+            if idx >= 0 and idx < row_count:
+                raw = safe_text(value_at(combination_values, idx)).strip().lower()
+                target = safe_text(target_label).strip().lower()
+                if not raw or raw == target or raw in target or target in raw:
+                    return idx
+        except:
+            pass
+        idx = find_matching_label_index(combination_values, target_label)
+        if idx is not None and idx >= 0 and idx < row_count:
+            return idx
+        try:
+            idx = int(step.get("index", 0))
+            if idx >= 0 and idx < row_count:
+                return idx
+        except:
+            pass
+        return None
+    if kind == "current":
+        return row_count - 1
+    return None
+
+
+def select_tabular_row_value(min_values, max_values, avg_values, row_index, source_label):
+    min_val = value_at(min_values, row_index)
+    max_val = value_at(max_values, row_index)
+    avg_val = value_at(avg_values, row_index)
+    if min_val is not None and max_val is not None:
+        if approx_equal(min_val, max_val):
+            return max_val, ""
+        selected = max_val
+        if abs(min_val) > abs(max_val):
+            selected = min_val
+        note = "{0} row {1} selected larger absolute value from tabular min/max (min={2}, max={3})".format(
+            source_label, row_index + 1, fmt_value(min_val), fmt_value(max_val)
+        )
+        return selected, note
+    if avg_val is not None:
+        return avg_val, ""
+    if max_val is not None:
+        return max_val, ""
+    if min_val is not None:
+        return min_val, ""
+    return None, "{0} row {1} has no numeric Minimum/Maximum/Average value".format(source_label, row_index + 1)
+
+
+def build_tabular_history_values(udr, steps, time_values, combination_values, min_values, max_values, avg_values, source_label):
+    row_count = max(len(min_values), len(max_values), len(avg_values))
+    if row_count < 1:
+        return None, "{0} did not expose numeric Minimum/Maximum/Average rows".format(source_label)
+    time_lookup = build_tabular_time_lookup(time_values)
+    combination_lookup = build_tabular_label_lookup(combination_values)
+    values_by_step = {}
+    for step in steps:
+        row_index = tabular_row_index_for_step(step, row_count, time_values, combination_values, time_lookup, combination_lookup)
+        if row_index is None:
+            return None, "Could not align {0} rows to {1} {2}".format(source_label, step.get("kind", ""), step.get("label", ""))
+        value, note = select_tabular_row_value(min_values, max_values, avg_values, row_index, source_label + " " + safe_name(udr))
+        if value is None:
+            return None, note
+        values_by_step[step_key(step)] = (value, note)
+    if not values_by_step:
+        return None, "{0} produced no matching rows".format(source_label)
+    return values_by_step, ""
+
+
+def read_tabular_history_values(udr, steps, log):
+    try:
+        plot_data = udr.PlotData
+    except Exception as exc:
+        return None, "Tabular Data unavailable: " + safe_text(exc)
+    if plot_data is None:
+        return None, "Tabular Data unavailable: result table is empty"
+    min_values = numeric_column_values(plotdata_column_loose(plot_data, TABULAR_MIN_KEYS))
+    max_values = numeric_column_values(plotdata_column_loose(plot_data, TABULAR_MAX_KEYS))
+    avg_values = numeric_column_values(plotdata_column_loose(plot_data, TABULAR_AVG_KEYS))
+    row_count = max(len(min_values), len(max_values), len(avg_values))
+    if row_count < 1:
+        return None, "Tabular Data did not expose Minimum/Maximum/Average time-history columns"
+    time_values = column_values(plotdata_column_loose(plot_data, TABULAR_TIME_KEYS))
+    combination_values = column_values(plotdata_column_loose(plot_data, TABULAR_COMBINATION_KEYS))
+    return build_tabular_history_values(udr, steps, time_values, combination_values, min_values, max_values, avg_values, "Tabular Data")
+
+
+def get_tabular_pane_enum():
+    try:
+        return MechanicalPanelEnum.TabularData, ""
+    except:
+        pass
+    try:
+        from Ansys.ACT.Interfaces.Mechanical import MechanicalPanelEnum as LocalMechanicalPanelEnum
+        return LocalMechanicalPanelEnum.TabularData, ""
+    except Exception as exc:
+        return None, "MechanicalPanelEnum.TabularData unavailable: " + safe_text(exc)
+
+
+def activate_tree_object(obj):
+    try:
+        DataModel.GetObjectById(obj.ObjectId).Activate()
+    except:
+        try:
+            obj.Activate()
+        except Exception as exc:
+            return "Could not activate object: " + safe_text(exc)
+    return ""
+
+
+def tabular_pane_control():
+    panel_enum, reason = get_tabular_pane_enum()
+    if panel_enum is None:
+        return None, reason
+    try:
+        pane = ExtAPI.UserInterface.GetPane(panel_enum)
+    except Exception as exc:
+        return None, "Could not get Mechanical Tabular Data pane: " + safe_text(exc)
+    if pane is None:
+        return None, "Mechanical Tabular Data pane is unavailable"
+    try:
+        control = pane.ControlUnknown
+    except Exception as exc:
+        return None, "Could not get Tabular Data pane control: " + safe_text(exc)
+    if control is None:
+        return None, "Tabular Data pane control is empty"
+    return control, ""
+
+
+def tabular_pane_cell_text(control, row_index, column_index):
+    try:
+        return safe_text(control.cell(row_index, column_index).Text).strip()
+    except:
+        return ""
+    return ""
+
+
+def read_tabular_pane_grid(control):
+    try:
+        row_count = int(control.RowsCount)
+        column_count = int(control.ColumnsCount)
+    except Exception as exc:
+        return None, "Could not read Tabular Data pane dimensions: " + safe_text(exc)
+    if row_count < 1 or column_count < 1:
+        return None, "Tabular Data pane has no readable rows or columns"
+    rows = []
+    for r in range(1, row_count + 1):
+        row = []
+        has_text = False
+        for c in range(1, column_count + 1):
+            text = tabular_pane_cell_text(control, r, c)
+            if text:
+                has_text = True
+            row.append(text)
+        if has_text:
+            rows.append(row)
+    if len(rows) < 1:
+        return None, "Tabular Data pane cells are empty"
+    return rows, ""
+
+
+def tabular_pane_numeric_count(row):
+    count = 0
+    for text in row:
+        if first_number(text) is not None:
+            count += 1
+    return count
+
+
+def tabular_pane_data_start(rows):
+    for i, row in enumerate(rows):
+        if tabular_pane_numeric_count(row) >= 2:
+            return i
+    return None
+
+
+def tabular_pane_headers(header_rows, column_count):
+    headers = []
+    for c in range(column_count):
+        parts = []
+        for row in header_rows:
+            try:
+                text = safe_text(row[c]).strip()
+            except:
+                text = ""
+            if text:
+                parts.append(text)
+        headers.append(" ".join(parts))
+    return headers
+
+
+def tabular_pane_column_index(headers, keys):
+    normalized = {}
+    for key in keys:
+        normalized[normalize_column_label(key)] = True
+    for i, label in enumerate(headers):
+        norm = normalize_column_label(label)
+        if norm in normalized:
+            return i
+        for key in normalized:
+            if norm and (norm in key or key in norm):
+                return i
+    return None
+
+
+def compact_tabular_pane_columns(headers, columns):
+    compact_headers = []
+    compact_columns = []
+    for i, column in enumerate(columns):
+        header = ""
+        try:
+            header = headers[i]
+        except:
+            header = ""
+        has_data = False
+        for value in column:
+            if safe_text(value).strip():
+                has_data = True
+                break
+        if header or has_data:
+            compact_headers.append(header)
+            compact_columns.append(column)
+    return compact_headers, compact_columns
+
+
+def compact_tabular_pane_column_specs(headers, columns):
+    specs = []
+    for i, column in enumerate(columns):
+        header = ""
+        try:
+            header = headers[i]
+        except:
+            header = ""
+        has_data = False
+        for value in column:
+            if safe_text(value).strip():
+                has_data = True
+                break
+        if header or has_data:
+            specs.append({"raw_index": i, "header": header, "column": column})
+    return specs
+
+
+def tabular_pane_column(headers, columns, keys, fallback_index):
+    idx = tabular_pane_column_index(headers, keys)
+    if idx is not None and idx >= 0 and idx < len(columns):
+        return columns[idx]
+    try:
+        if fallback_index is not None and fallback_index >= 0 and fallback_index < len(columns):
+            return columns[fallback_index]
+    except:
+        pass
+    return []
+
+
+def tabular_pane_layout_column_index(headers, keys, fallback_index):
+    idx = tabular_pane_column_index(headers, keys)
+    if idx is not None:
+        return idx
+    return fallback_index
+
+
+def infer_tabular_pane_layout(rows):
+    data_start = tabular_pane_data_start(rows)
+    if data_start is None:
+        return None, "Tabular Data pane has no rows with numeric result values"
+    header_rows = rows[:data_start]
+    data_rows = []
+    for row in rows[data_start:]:
+        if tabular_pane_numeric_count(row) >= 2:
+            data_rows.append(row)
+    if len(data_rows) < 1:
+        return None, "Tabular Data pane has no numeric data rows"
+    column_count = 0
+    for row in rows:
+        if len(row) > column_count:
+            column_count = len(row)
+    headers = tabular_pane_headers(header_rows, column_count)
+    columns = []
+    for c in range(column_count):
+        column = []
+        for row in data_rows:
+            try:
+                column.append(row[c])
+            except:
+                column.append("")
+        columns.append(column)
+    specs = compact_tabular_pane_column_specs(headers, columns)
+    if len(specs) < 1:
+        return None, "Tabular Data pane did not expose readable columns"
+    compact_headers = [spec["header"] for spec in specs]
+
+    min_fallback = None
+    max_fallback = None
+    avg_fallback = None
+    if len(specs) >= 3:
+        min_fallback = len(specs) - 3
+        max_fallback = len(specs) - 2
+        avg_fallback = len(specs) - 1
+
+    time_fallback = None
+    if len(specs) >= 5:
+        time_fallback = 1
+    elif len(specs) >= 4:
+        time_fallback = 0
+
+    def raw_index(compact_index):
+        try:
+            if compact_index is not None and compact_index >= 0 and compact_index < len(specs):
+                return specs[compact_index]["raw_index"]
+        except:
+            pass
+        return None
+
+    time_index = raw_index(tabular_pane_layout_column_index(compact_headers, TABULAR_TIME_KEYS, time_fallback))
+    combination_index = raw_index(tabular_pane_layout_column_index(compact_headers, TABULAR_COMBINATION_KEYS, 0))
+    min_index = raw_index(tabular_pane_layout_column_index(compact_headers, TABULAR_MIN_KEYS, min_fallback))
+    max_index = raw_index(tabular_pane_layout_column_index(compact_headers, TABULAR_MAX_KEYS, max_fallback))
+    avg_index = raw_index(tabular_pane_layout_column_index(compact_headers, TABULAR_AVG_KEYS, avg_fallback))
+    if min_index is None and max_index is None and avg_index is None and len(specs) > 0:
+        avg_index = specs[-1]["raw_index"]
+    return {
+        "data_start": data_start,
+        "data_row_count": len(data_rows),
+        "column_count": column_count,
+        "time_index": time_index,
+        "combination_index": combination_index,
+        "min_index": min_index,
+        "max_index": max_index,
+        "avg_index": avg_index,
+        "compact_column_count": len(specs),
+    }, ""
+
+
+def tabular_pane_column_from_layout(data_rows, raw_index):
+    values = []
+    if raw_index is None:
+        return values
+    for row in data_rows:
+        try:
+            values.append(row[raw_index])
+        except:
+            values.append("")
+    return values
+
+
+def parse_tabular_pane_rows_with_layout(rows, layout):
+    try:
+        data_start = int(layout["data_start"])
+    except:
+        return None, "Tabular Data pane fixed layout is missing data_start"
+    data_row_count = 0
+    try:
+        data_row_count = int(layout.get("data_row_count", 0))
+    except:
+        data_row_count = 0
+    if data_row_count > 0:
+        data_rows = rows[data_start:data_start + data_row_count]
+    else:
+        data_rows = rows[data_start:]
+    if len(data_rows) < 1:
+        return None, "Tabular Data pane has no numeric data rows"
+    time_values = tabular_pane_column_from_layout(data_rows, layout.get("time_index", None))
+    combination_values = tabular_pane_column_from_layout(data_rows, layout.get("combination_index", None))
+    min_values = numeric_column_values(tabular_pane_column_from_layout(data_rows, layout.get("min_index", None)))
+    max_values = numeric_column_values(tabular_pane_column_from_layout(data_rows, layout.get("max_index", None)))
+    avg_values = numeric_column_values(tabular_pane_column_from_layout(data_rows, layout.get("avg_index", None)))
+    if max(len(min_values), len(max_values), len(avg_values)) < 1:
+        return None, "Tabular Data pane fixed layout produced no numeric Minimum/Maximum/Average values"
+    return {
+        "time_values": time_values,
+        "combination_values": combination_values,
+        "min_values": min_values,
+        "max_values": max_values,
+        "avg_values": avg_values,
+        "row_count": len(data_rows),
+        "column_count": layout.get("compact_column_count", ""),
+    }, ""
+
+
+def parse_tabular_pane_rows(rows):
+    layout, reason = infer_tabular_pane_layout(rows)
+    if layout is None:
+        return None, reason
+    parsed, reason = parse_tabular_pane_rows_with_layout(rows, layout)
+    if parsed is None:
+        return None, reason
+    parsed["layout"] = layout
+    return parsed, ""
+
+
+def read_tabular_pane_history_values(udr, steps, log, layout=None):
+    reason = activate_tree_object(udr)
+    if reason:
+        return None, reason, layout
+    control, reason = tabular_pane_control()
+    if control is None:
+        return None, reason, layout
+    rows, reason = read_tabular_pane_grid(control)
+    if not rows:
+        return None, reason, layout
+    if layout is None:
+        parsed, parse_reason = parse_tabular_pane_rows(rows)
+        if not parsed:
+            return None, parse_reason, layout
+        layout = parsed.get("layout", None)
+    else:
+        parsed, parse_reason = parse_tabular_pane_rows_with_layout(rows, layout)
+        if not parsed:
+            return None, parse_reason, layout
+    values_by_step, reason = build_tabular_history_values(
+        udr,
+        steps,
+        parsed["time_values"],
+        parsed["combination_values"],
+        parsed["min_values"],
+        parsed["max_values"],
+        parsed["avg_values"],
+        "Tabular Data pane",
+    )
+    return values_by_step, reason, layout
+
+
+def prepare_tabular_history_beta(env, steps, log, progress, start_percent, end_percent):
+    cache = {}
+    udrs = individual_udrs(env)
+    total = len(udrs)
+    if total < 1:
+        return cache
+    log.info("Tabular Data beta requested. The exporter will evaluate each individual UDR once, read its time-history/combination table, then fall back to scalar UDR evaluation where needed.")
+    if env.category == "SolutionCombination":
+        log.warn("Tabular Data beta is experimental for solution combinations. If Mechanical does not expose one row per combination, affected values fall back to scalar UDR evaluation.")
+    report_progress(progress, start_percent, "Preparing Tabular Data beta cache", "Evaluating {0} individual UDR(s) once before all-set table reads.".format(total))
+    span = float(end_percent - start_percent)
+    for i, udr in enumerate(udrs):
+        check_cancel(progress)
+        evaluate_result(udr, log)
+        values_by_step, reason = read_tabular_history_values(udr, steps, log)
+        if values_by_step:
+            cache[safe_object_id(udr)] = values_by_step
+            log.tabular_prepared += 1
+        else:
+            log.info("Tabular Data beta unavailable for {0}: {1}".format(safe_name(udr), reason))
+        pct = start_percent + int(span * float(i + 1) / float(max(1, total)))
+        report_progress(progress, pct, "Preparing Tabular Data beta cache", "{0} ({1}/{2})".format(safe_name(udr), i + 1, total))
+    if len(cache.keys()) < 1:
+        log.warn("Tabular Data beta preparation did not succeed for any individual UDR. The exporter will use scalar fallback where tabular rows cannot be read.")
+    else:
+        log.info("Tabular Data beta prepared {0}/{1} individual UDR(s).".format(len(cache.keys()), total))
+    return cache
+
+
+def tabular_pane_fast_precheck(udrs, log):
+    bad_states = []
+    readable_minmax = 0
+    bad_tokens = ["suppressed", "unsolved", "not solved", "notsolved", "not evaluated", "notevaluated", "needs update", "needsupdate", "invalid", "error"]
+    for udr in udrs:
+        state = ""
+        try:
+            state = safe_text(udr.ObjectState)
+        except:
+            state = ""
+        lower_state = state.lower().replace("_", " ")
+        for token in bad_tokens:
+            if token in lower_state:
+                bad_states.append("{0} ({1})".format(safe_name(udr), state))
+                break
+        min_val = None
+        max_val = None
+        try:
+            min_val = first_number(udr.Minimum)
+        except:
+            pass
+        try:
+            max_val = first_number(udr.Maximum)
+        except:
+            pass
+        if min_val is not None or max_val is not None:
+            readable_minmax += 1
+    if bad_states:
+        log.warn("Tabular Data pane beta fast precheck found result objects that do not look evaluated: " + "; ".join(bad_states[:8]))
+        return False
+    if readable_minmax < len(udrs):
+        log.info("Tabular Data pane beta fast precheck found existing Minimum/Maximum values on {0}/{1} UDR(s). Pane scraping will still be attempted without EvaluateAllResults; failed pane reads are recorded as fast misses.".format(readable_minmax, len(udrs)))
+    else:
+        log.info("Tabular Data pane beta fast precheck found existing Minimum/Maximum values on all {0} UDR(s). Skipping EvaluateAllResults before pane scraping.".format(len(udrs)))
+    return True
+
+
+def prepare_tabular_pane_history_beta(env, steps, log, progress, start_percent, end_percent):
+    cache = {}
+    udrs = individual_udrs(env)
+    total = len(udrs)
+    if total < 1:
+        return cache
+    log.info("Tabular Data pane beta requested. Fast mode assumes evaluated results are already present, activates each individual UDR, scrapes the visible Tabular Data pane once, reuses the first successful table layout, and does not call EvaluateAllResults unless the fast precheck fails.")
+    if env.category == "SolutionCombination":
+        log.warn("Tabular Data pane beta is experimental for solution combinations. If Mechanical does not show one readable row per combination in the pane, affected values are recorded as pane misses unless the fast precheck failed.")
+    if not tabular_pane_fast_precheck(udrs, log):
+        log.warn("Tabular Data pane beta fast precheck failed. The exporter will use scalar fallback where no pane cache is available.")
+        cache["__fast_precheck_failed__"] = True
+        return cache
+    report_progress(progress, start_percent, "Preparing Tabular Data pane beta cache", "Activating {0} individual UDR(s) and reading the visible Tabular Data pane.".format(total))
+    span = float(end_percent - start_percent)
+    layout = None
+    for i, udr in enumerate(udrs):
+        check_cancel(progress)
+        values_by_step, reason, next_layout = read_tabular_pane_history_values(udr, steps, log, layout)
+        if values_by_step:
+            if layout is None and next_layout is not None:
+                layout = next_layout
+                log.info("Tabular Data pane beta fixed layout inferred from {0}: data_start={1}, data_rows={2}, time_col={3}, combination_col={4}, min_col={5}, max_col={6}, avg_col={7}".format(
+                    safe_name(udr),
+                    safe_text(layout.get("data_start", "")),
+                    safe_text(layout.get("data_row_count", "")),
+                    safe_text(layout.get("time_index", "")),
+                    safe_text(layout.get("combination_index", "")),
+                    safe_text(layout.get("min_index", "")),
+                    safe_text(layout.get("max_index", "")),
+                    safe_text(layout.get("avg_index", "")),
+                ))
+            cache[safe_object_id(udr)] = values_by_step
+            log.tabular_pane_prepared += 1
+        else:
+            log.info("Tabular Data pane beta unavailable for {0}: {1}".format(safe_name(udr), reason))
+        pct = start_percent + int(span * float(i + 1) / float(max(1, total)))
+        report_progress(progress, pct, "Preparing Tabular Data pane beta cache", "{0} ({1}/{2})".format(safe_name(udr), i + 1, total))
+    if len(cache.keys()) < 1:
+        log.warn("Tabular Data pane beta preparation did not succeed for any individual UDR. Fast pane reads will be recorded as misses unless the fast precheck failed.")
+    else:
+        log.info("Tabular Data pane beta prepared {0}/{1} individual UDR(s).".format(len(cache.keys()), total))
+    return cache
+
+
+def read_tabular_cached_value(cache, udr, step, source_label="Tabular Data"):
+    try:
+        per_udr = cache[safe_object_id(udr)]
+    except:
+        return None, "No {0} cache for {1}".format(source_label, safe_name(udr))
+    try:
+        return per_udr[step_key(step)]
+    except:
+        return None, "No {0} row for {1} at {2}".format(source_label, safe_name(udr), safe_text(step.get("label", "")))
+
+
+def node_ids_from_udr(udr):
+    candidates = []
+    try:
+        candidates.append(udr.Location)
+    except:
+        pass
+    try:
+        candidates.append(udr.Location.Location)
+    except:
+        pass
+    for item in candidates:
+        try:
+            ids = [int(x) for x in item.Ids]
+            if len(ids) > 0:
+                return ids
+        except:
+            pass
+    return []
+
+
+def result_file_for_environment(env):
+    if env.category == "SolutionCombination":
+        return ""
+    candidates = []
+    try:
+        candidates.append(safe_text(env.owner.ResultFileName))
+    except:
+        pass
+    try:
+        candidates.append(System.IO.Path.Combine(safe_text(env.owner.WorkingDir), "file.rst"))
+    except:
+        pass
+    for path in candidates:
+        if path and System.IO.File.Exists(path):
+            return path
+    return ""
+
+
+def prepare_dpf_beta_context(env, log, progress, start_percent, end_percent):
+    report_progress(progress, start_percent, "Preparing DPF beta reader", "Loading mech_dpf and result data source.")
+    ctx = {"available": False, "reason": "", "dpf": None, "data_sources": None, "streams": None, "result_file": "", "disabled_ops": {}}
+    if env.category == "SolutionCombination":
+        ctx["reason"] = "DPF beta reads solver result files directly and does not currently reproduce Mechanical solution-combination bookkeeping."
+        log.warn(ctx["reason"] + " Scalar fallback will be used for this export.")
+        report_progress(progress, end_percent, "DPF beta unavailable", "Solution combination selected; scalar fallback will be used.")
+        return ctx
+    result_file = result_file_for_environment(env)
+    if not result_file:
+        ctx["reason"] = "No solved result file (.rst) was found for the selected analysis."
+        log.warn(ctx["reason"] + " Scalar fallback will be used.")
+        report_progress(progress, end_percent, "DPF beta unavailable", ctx["reason"])
+        return ctx
+    try:
+        import mech_dpf
+        import Ans.DataProcessing as dpf
+        mech_dpf.setExtAPI(ExtAPI)
+        data_sources = dpf.DataSources(result_file)
+        ctx["dpf"] = dpf
+        ctx["data_sources"] = data_sources
+        ctx["result_file"] = result_file
+        try:
+            stream_op = dpf.operators.metadata.streams_provider()
+            stream_op.inputs.data_sources.Connect(data_sources)
+            ctx["streams"] = stream_op.outputs.streams_container.GetData()
+        except:
+            ctx["streams"] = None
+        ctx["available"] = True
+        log.dpf_prepared = 1
+        log.info("DPF beta prepared with result file: " + result_file)
+        report_progress(progress, end_percent, "DPF beta ready", result_file)
+        return ctx
+    except Exception as exc:
+        ctx["reason"] = "Could not initialize mech_dpf/Ans.DataProcessing: " + safe_text(exc)
+        log.warn(ctx["reason"] + " Scalar fallback will be used.")
+        report_progress(progress, end_percent, "DPF beta unavailable", safe_text(exc))
+        return ctx
+
+
+def dpf_scoping_for_nodes(dpf, node_ids):
+    scoping = dpf.Scoping()
+    scoping.Ids = [int(x) for x in node_ids]
+    try:
+        scoping.Location = dpf.locations.nodal
+    except:
+        scoping.Location = "Nodal"
+    return scoping
+
+
+def dpf_time_scoping(dpf, step):
+    scoping = dpf.Scoping()
+    idx = 1
+    try:
+        idx = int(step["index"])
+    except:
+        idx = 1
+    if idx < 1:
+        idx = 1
+    scoping.Ids = [idx]
+    return scoping
+
+
+def get_field_by_step(fields_container, step):
+    idx = 1
+    try:
+        idx = int(step["index"])
+    except:
+        idx = 1
+    if idx < 1:
+        idx = 1
+    try:
+        return fields_container.GetFieldByTimeId(idx)
+    except:
+        pass
+    try:
+        return fields_container[0]
+    except:
+        return None
+
+
+def numeric_component_values_from_field(field, node_ids, component_index):
+    values = []
+    for node_id in node_ids:
+        try:
+            data = list_values(field.GetEntityDataById(int(node_id)))
+            if len(data) > component_index:
+                num = first_number(data[component_index])
+                if num is not None:
+                    values.append(num)
+        except:
+            pass
+    if values:
+        return values
+    try:
+        ids = list_values(field.Scoping.Ids)
+    except:
+        ids = []
+    wanted = {}
+    for node_id in node_ids:
+        wanted[int(node_id)] = True
+    for i, raw_id in enumerate(ids):
+        try:
+            entity_id = int(raw_id)
+        except:
+            continue
+        if entity_id not in wanted:
+            continue
+        try:
+            data = list_values(field.GetEntityDataByIndex(i))
+            if len(data) > component_index:
+                num = first_number(data[component_index])
+                if num is not None:
+                    values.append(num)
+        except:
+            pass
+    if values:
+        return values
+    try:
+        ncomp = int(field.ComponentCount)
+    except:
+        try:
+            ncomp = int(field.NComp)
+        except:
+            ncomp = 0
+    if ncomp > component_index:
+        raw_data = list_values(field.Data)
+        for i in range(component_index, len(raw_data), ncomp):
+            num = first_number(raw_data[i])
+            if num is not None:
+                values.append(num)
+    return values
+
+
+def numeric_component_values_for_requested_ids(field, node_ids, component_index):
+    values = []
+    for node_id in node_ids:
+        try:
+            data = list_values(field.GetEntityDataById(int(node_id)))
+            if len(data) > component_index:
+                num = first_number(data[component_index])
+                if num is not None:
+                    values.append(num)
+        except:
+            pass
+    if values:
+        return values
+    try:
+        ids = list_values(field.Scoping.Ids)
+    except:
+        ids = []
+    if not ids:
+        return []
+    wanted = {}
+    for node_id in node_ids:
+        wanted[int(node_id)] = True
+    for i, raw_id in enumerate(ids):
+        try:
+            entity_id = int(raw_id)
+        except:
+            continue
+        if entity_id not in wanted:
+            continue
+        try:
+            data = list_values(field.GetEntityDataByIndex(i))
+            if len(data) > component_index:
+                num = first_number(data[component_index])
+                if num is not None:
+                    values.append(num)
+        except:
+            pass
+    return values
+
+
+def select_scalar_from_numeric_values(values, source_label):
+    if not values:
+        return None, source_label + " returned no numeric values"
+    if len(values) == 1:
+        return values[0], ""
+    min_val = min(values)
+    max_val = max(values)
+    if approx_equal(min_val, max_val):
+        return max_val, ""
+    selected = max_val
+    if abs(min_val) > abs(max_val):
+        selected = min_val
+    note = "{0} selected larger absolute value from {1} values (min={2}, max={3})".format(
+        source_label, len(values), fmt_value(min_val), fmt_value(max_val)
+    )
+    return selected, note
+
+
+def disable_dpf_operator(ctx, op_kind, reason, log):
+    if ctx is None:
+        return reason
+    try:
+        disabled = ctx.get("disabled_ops", {})
+    except:
+        disabled = {}
+    if op_kind in disabled:
+        return ""
+    disabled[op_kind] = reason
+    try:
+        ctx["disabled_ops"] = disabled
+    except:
+        pass
+    try:
+        log.warn(reason)
+        log.dpf_disabled_ops.append(op_kind)
+    except:
+        pass
+    return reason
+
+
+def read_dpf_value(ctx, expr, udr, step, cache, log):
+    if ctx is None or not ctx.get("available", False):
+        reason = ""
+        if ctx is not None:
+            reason = ctx.get("reason", "")
+        if not reason:
+            reason = "DPF beta context is unavailable"
+        return None, reason
+
+    op_kind = ""
+    source_label = ""
+    component_index = 0
+    if expr in FORCE_EXPRESSIONS:
+        op_kind = "ENF"
+        source_label = "DPF ENF " + expr
+        component_index = FORCE_EXPRESSIONS.index(expr)
+    elif expr in MOMENT_EXPRESSIONS:
+        op_kind = "M"
+        source_label = "DPF M/nodal_moment " + expr
+        component_index = MOMENT_EXPRESSIONS.index(expr)
+    else:
+        return None, "DPF beta has no operator mapping for " + expr
+
+    try:
+        disabled = ctx.get("disabled_ops", {})
+        if op_kind in disabled:
+            return None, ""
+    except:
+        pass
+
+    node_ids = node_ids_from_udr(udr)
+    if not node_ids:
+        return None, "Could not read nodal IDs from " + node_selection_name(udr)
+
+    key = (op_kind, tuple(node_ids), safe_text(step.get("index", "")))
+    try:
+        field = cache[key]
+    except:
+        field = None
+    if field is None:
+        try:
+            dpf = ctx["dpf"]
+            if op_kind == "ENF":
+                op = dpf.operators.result.element_nodal_forces()
+            else:
+                op = dpf.operators.result.nodal_moment()
+            op.inputs.data_sources.Connect(ctx["data_sources"])
+            op.inputs.time_scoping.Connect(dpf_time_scoping(dpf, step))
+            op.inputs.mesh_scoping.Connect(dpf_scoping_for_nodes(dpf, node_ids))
+            if op_kind == "ENF":
+                try:
+                    op.inputs.requested_location.Connect("Nodal")
+                except:
+                    pass
+            try:
+                op.inputs.bool_rotate_to_global.Connect(True)
+            except:
+                pass
+            if op_kind == "ENF":
+                try:
+                    op.inputs.read_beams.Connect(True)
+                except:
+                    pass
+            try:
+                if ctx.get("streams", None) is not None:
+                    op.inputs.streams_container.Connect(ctx["streams"])
+            except:
+                pass
+            fields_container = op.outputs.fields_container.GetData()
+            field = get_field_by_step(fields_container, step)
+            if field is None:
+                return None, "DPF {0} operator returned no field".format(op_kind)
+            cache[key] = field
+        except Exception as exc:
+            msg = safe_text(exc)
+            if ("Source operator" in msg and "not found" in msg) or ("mapdl::rst::{0}".format(op_kind) in msg and "not found" in msg):
+                reason = "DPF {0} source operator is not registered in this Mechanical-hosted DPF server ({1}). Further {0} reads are skipped and scalar UDR fallback is used.".format(op_kind, msg)
+                return None, disable_dpf_operator(ctx, op_kind, reason, log)
+            return None, "DPF {0} read failed: {1}".format(op_kind, msg)
+    values = numeric_component_values_from_field(field, node_ids, component_index)
+    return select_scalar_from_numeric_values(values, source_label)
+
+
+def read_dpf_joint_value(ctx, expr, udr, step, cache, log):
+    if ctx is None or not ctx.get("available", False):
+        reason = ""
+        if ctx is not None:
+            reason = ctx.get("reason", "")
+        if not reason:
+            reason = "DPF joint beta context is unavailable"
+        return None, reason
+
+    op_kind = ""
+    source_label = ""
+    component_index = 0
+    if expr in FORCE_EXPRESSIONS:
+        op_kind = "JFL"
+        source_label = "DPF JFL/joint_force_reaction " + expr
+        component_index = FORCE_EXPRESSIONS.index(expr)
+    elif expr in MOMENT_EXPRESSIONS:
+        op_kind = "JML"
+        source_label = "DPF JML/joint_moment_reaction " + expr
+        component_index = MOMENT_EXPRESSIONS.index(expr)
+    else:
+        return None, "DPF joint beta has no operator mapping for " + expr
+
+    try:
+        disabled = ctx.get("disabled_ops", {})
+        if op_kind in disabled:
+            return None, ""
+    except:
+        pass
+
+    node_ids = node_ids_from_udr(udr)
+    if not node_ids:
+        return None, "Could not read nodal IDs from " + node_selection_name(udr)
+
+    key = (op_kind, tuple(node_ids), safe_text(step.get("index", "")))
+    try:
+        field = cache[key]
+    except:
+        field = None
+    if field is None:
+        try:
+            dpf = ctx["dpf"]
+            if op_kind == "JFL":
+                op = dpf.operators.result.joint_force_reaction()
+            else:
+                op = dpf.operators.result.joint_moment_reaction()
+            op.inputs.data_sources.Connect(ctx["data_sources"])
+            op.inputs.time_scoping.Connect(dpf_time_scoping(dpf, step))
+            op.inputs.mesh_scoping.Connect(dpf_scoping_for_nodes(dpf, node_ids))
+            try:
+                # False keeps the native/joint result coordinate system when the DPF server supports it.
+                op.inputs.bool_rotate_to_global.Connect(False)
+            except:
+                pass
+            try:
+                if ctx.get("streams", None) is not None:
+                    op.inputs.streams_container.Connect(ctx["streams"])
+            except:
+                pass
+            fields_container = op.outputs.fields_container.GetData()
+            field = get_field_by_step(fields_container, step)
+            if field is None:
+                return None, "DPF {0} operator returned no field".format(op_kind)
+            cache[key] = field
+        except Exception as exc:
+            msg = safe_text(exc)
+            if ("Source operator" in msg and "not found" in msg) or ("mapdl::rst::{0}".format(op_kind) in msg and "not found" in msg):
+                reason = "DPF {0} joint reaction source operator is not registered in this Mechanical-hosted DPF server ({1}). Further {0} reads are skipped and scalar UDR fallback is used.".format(op_kind, msg)
+                return None, disable_dpf_operator(ctx, op_kind, reason, log)
+            if ("result" in msg.lower() and "not found" in msg.lower()) or ("not available" in msg.lower()):
+                reason = "DPF {0} joint reaction result is not available in this result file ({1}). Further {0} reads are skipped and scalar UDR fallback is used.".format(op_kind, msg)
+                return None, disable_dpf_operator(ctx, op_kind, reason, log)
+            return None, "DPF {0} joint reaction read failed: {1}".format(op_kind, msg)
+
+    values = numeric_component_values_for_requested_ids(field, node_ids, component_index)
+    if not values:
+        try:
+            log.dpf_joint_node_misses += 1
+        except:
+            pass
+        return None, "DPF {0} joint reaction field did not contain the scoped bolt node(s) {1}; these nodes may not be joint solver nodes, or the joint result may be scoped to a different side/entity.".format(op_kind, ",".join([safe_text(x) for x in node_ids]))
+    return select_scalar_from_numeric_values(values, source_label)
+
+
 def read_result_value(udr, log):
     min_val = None
     max_val = None
@@ -704,7 +2036,7 @@ def read_result_value(udr, log):
     return selected, note
 
 
-def extract_individual_rows(env, include_time_history, log):
+def extract_individual_rows(env, include_time_history, log, progress=None, start_percent=10, end_percent=75, use_tabular_beta=False, use_tabular_pane_beta=False, use_plotdata_beta=False, use_dpf_beta=False, use_dpf_joint_beta=False):
     steps = get_analysis_steps(env, log)
     if not include_time_history and steps:
         steps = [steps[-1]]
@@ -714,11 +2046,65 @@ def extract_individual_rows(env, include_time_history, log):
     for udr in env.all_udrs():
         states[safe_object_id(udr)] = (udr, capture_state(udr))
 
+    total_evals = 0
+    for bolt in env.individual:
+        for expr in EXPRESSIONS:
+            if expr in env.individual[bolt]:
+                total_evals += len(steps)
+    done_evals = 0
+    update_stride = max(1, int(max(1, total_evals) / 100))
+    read_start_percent = start_percent
+    tabular_cache = {}
+    tabular_pane_cache = {}
+    dpf_context = None
+    dpf_cache = {}
+    try:
+        if use_tabular_beta:
+            prep_end = start_percent + int(float(end_percent - start_percent) * 0.25)
+            if prep_end <= start_percent:
+                prep_end = start_percent + 1
+            tabular_cache = prepare_tabular_history_beta(env, steps, log, progress, start_percent, prep_end)
+            read_start_percent = prep_end
+            report_progress(progress, read_start_percent, "Reading Tabular Data beta cache", "Preparing {0} tabular/scalar result read(s).".format(total_evals))
+        elif use_tabular_pane_beta:
+            prep_end = start_percent + int(float(end_percent - start_percent) * 0.35)
+            if prep_end <= start_percent:
+                prep_end = start_percent + 1
+            tabular_pane_cache = prepare_tabular_pane_history_beta(env, steps, log, progress, start_percent, prep_end)
+            read_start_percent = prep_end
+            report_progress(progress, read_start_percent, "Reading Tabular Data pane beta cache", "Preparing {0} fast pane result lookup(s).".format(total_evals))
+        elif use_dpf_beta or use_dpf_joint_beta:
+            prep_end = start_percent + int(float(end_percent - start_percent) * 0.18)
+            if prep_end <= start_percent:
+                prep_end = start_percent + 1
+            dpf_context = prepare_dpf_beta_context(env, log, progress, start_percent, prep_end)
+            read_start_percent = prep_end
+            if use_dpf_joint_beta:
+                report_progress(progress, read_start_percent, "Reading DPF joint reaction beta fields", "Preparing {0} joint DPF/scalar result read(s).".format(total_evals))
+            else:
+                report_progress(progress, read_start_percent, "Reading DPF beta fields", "Preparing {0} DPF/scalar result read(s).".format(total_evals))
+        elif use_plotdata_beta:
+            prep_end = start_percent + int(float(end_percent - start_percent) * 0.25)
+            if prep_end <= start_percent:
+                prep_end = start_percent + 1
+            prepare_plotdata_beta(env, log, progress, start_percent, prep_end)
+            read_start_percent = prep_end
+            report_progress(progress, read_start_percent, "Reading PlotData beta tables", "Preparing {0} result table read(s).".format(total_evals))
+        else:
+            report_progress(progress, start_percent, "Evaluating bolt UDRs", "Preparing {0} result evaluation(s).".format(total_evals))
+    except ExportCancelledException:
+        for key in states:
+            obj, state = states[key]
+            restore_state(obj, state)
+        raise
+
     try:
         for bolt in sorted(env.individual.keys()):
+            check_cancel(progress)
             rows = []
             expr_map = env.individual[bolt]
             for step in steps:
+                check_cancel(progress)
                 row = {
                     "environment": env.name,
                     "environment_type": env.category,
@@ -731,6 +2117,7 @@ def extract_individual_rows(env, include_time_history, log):
                     "notes": [],
                 }
                 for expr in EXPRESSIONS:
+                    check_cancel(progress)
                     if expr not in expr_map:
                         row["values"][expr] = ""
                         row["notes"].append("missing " + expr)
@@ -740,9 +2127,110 @@ def extract_individual_rows(env, include_time_history, log):
                         row["node_selection"] = node_selection_name(udr)
                     if expr not in unit_by_expr:
                         unit_by_expr[expr] = result_unit(udr)
-                    apply_step(udr, env, step, log)
-                    evaluate_result(udr, log)
-                    value, note = read_result_value(udr, log)
+                    if not use_tabular_beta and not use_tabular_pane_beta:
+                        check_cancel(progress)
+                        apply_step(udr, env, step, log)
+                    value = None
+                    note = ""
+                    if use_tabular_beta:
+                        value, note = read_tabular_cached_value(tabular_cache, udr, step)
+                        if value is None:
+                            log.tabular_fallbacks += 1
+                            fallback_note = note
+                            check_cancel(progress)
+                            apply_step(udr, env, step, log)
+                            check_cancel(progress)
+                            evaluate_result(udr, log)
+                            value, note = read_result_value(udr, log)
+                            if fallback_note:
+                                row["notes"].append("Tabular Data fallback for {0}: {1}".format(expr, fallback_note))
+                        else:
+                            log.tabular_hits += 1
+                    elif use_tabular_pane_beta:
+                        value, note = read_tabular_cached_value(tabular_pane_cache, udr, step, "Tabular Data pane")
+                        if value is None:
+                            log.tabular_pane_fallbacks += 1
+                            fallback_note = note
+                            if tabular_pane_cache.get("__fast_precheck_failed__", False):
+                                check_cancel(progress)
+                                apply_step(udr, env, step, log)
+                                check_cancel(progress)
+                                evaluate_result(udr, log)
+                                value, note = read_result_value(udr, log)
+                                if fallback_note:
+                                    row["notes"].append("Tabular Data pane scalar fallback for {0}: {1}".format(expr, fallback_note))
+                            else:
+                                value = ""
+                                note = ""
+                                if fallback_note:
+                                    row["notes"].append("Tabular Data pane fast miss for {0}: {1}".format(expr, fallback_note))
+                        else:
+                            log.tabular_pane_hits += 1
+                    elif use_dpf_joint_beta:
+                        value, note = read_dpf_joint_value(dpf_context, expr, udr, step, dpf_cache, log)
+                        if value is None:
+                            log.dpf_fallbacks += 1
+                            log.dpf_joint_fallbacks += 1
+                            fallback_note = note
+                            check_cancel(progress)
+                            evaluate_result(udr, log)
+                            value, note = read_result_value(udr, log)
+                            if fallback_note:
+                                row["notes"].append("DPF joint fallback for {0}: {1}".format(expr, fallback_note))
+                        else:
+                            log.dpf_hits += 1
+                            log.dpf_joint_hits += 1
+                    elif use_dpf_beta:
+                        value, note = read_dpf_value(dpf_context, expr, udr, step, dpf_cache, log)
+                        if value is None:
+                            log.dpf_fallbacks += 1
+                            fallback_note = note
+                            check_cancel(progress)
+                            evaluate_result(udr, log)
+                            value, note = read_result_value(udr, log)
+                            if fallback_note:
+                                row["notes"].append("DPF fallback for {0}: {1}".format(expr, fallback_note))
+                        else:
+                            log.dpf_hits += 1
+                    elif use_plotdata_beta:
+                        value, note = read_plotdata_value(udr)
+                        if value is None:
+                            log.plotdata_fallbacks += 1
+                            fallback_note = note
+                            check_cancel(progress)
+                            evaluate_result(udr, log)
+                            value, note = read_result_value(udr, log)
+                            if fallback_note:
+                                row["notes"].append("PlotData fallback for {0}: {1}".format(expr, fallback_note))
+                        else:
+                            log.plotdata_hits += 1
+                    else:
+                        check_cancel(progress)
+                        evaluate_result(udr, log)
+                        value, note = read_result_value(udr, log)
+                    done_evals += 1
+                    if (done_evals == total_evals) or (done_evals % update_stride == 0):
+                        span = float(end_percent - read_start_percent)
+                        pct = read_start_percent
+                        if total_evals > 0:
+                            pct = read_start_percent + int(span * float(done_evals) / float(total_evals))
+                        status = "Evaluating Mechanical result objects"
+                        if use_tabular_beta:
+                            status = "Reading Tabular Data beta cache"
+                        if use_tabular_pane_beta:
+                            status = "Reading Tabular Data pane beta cache"
+                        if use_plotdata_beta:
+                            status = "Reading PlotData beta result tables"
+                        if use_dpf_joint_beta:
+                            status = "Reading DPF joint reaction beta fields"
+                        if use_dpf_beta:
+                            status = "Reading DPF beta result fields"
+                        report_progress(
+                            progress,
+                            pct,
+                            status,
+                            "Bolt {0}, {1}, {2} ({3}/{4})".format(bolt, step["label"], expr, done_evals, total_evals),
+                        )
                     row["values"][expr] = value
                     if note:
                         row["notes"].append(note)
@@ -802,36 +2290,57 @@ def compute_screening(rows_by_bolt):
     return summaries
 
 
-def extract_existing_screening(env, log):
+def extract_existing_screening(env, log, progress=None, start_percent=76, end_percent=84):
     rows = []
-    for expr in EXPRESSIONS:
-        if expr not in env.screening:
-            continue
-        for label in SCREENING_LABELS:
-            if label not in env.screening[expr]:
-                continue
+    total = env.screening_udr_count()
+    done = 0
+    states = {}
+    for expr in env.screening:
+        for label in env.screening[expr]:
             udr = env.screening[expr][label]
-            evaluate_result(udr, log)
-            min_val = ""
-            max_val = ""
-            try:
-                min_val = number_or_text(udr.Minimum)
-            except:
-                pass
-            try:
-                max_val = number_or_text(udr.Maximum)
-            except:
-                pass
-            rows.append({
-                "environment": env.name,
-                "expression": expr,
-                "screening_result": label,
-                "source_udr": safe_name(udr),
-                "location": node_selection_name(udr),
-                "minimum": min_val,
-                "maximum": max_val,
-                "unit": result_unit(udr),
-            })
+            states[safe_object_id(udr)] = (udr, capture_state(udr))
+    report_progress(progress, start_percent, "Evaluating existing screening UDRs", "Preparing {0} screening result evaluation(s).".format(total))
+    try:
+        for expr in EXPRESSIONS:
+            check_cancel(progress)
+            if expr not in env.screening:
+                continue
+            for label in SCREENING_LABELS:
+                check_cancel(progress)
+                if label not in env.screening[expr]:
+                    continue
+                udr = env.screening[expr][label]
+                evaluate_result(udr, log)
+                done += 1
+                span = float(end_percent - start_percent)
+                pct = end_percent
+                if total > 0:
+                    pct = start_percent + int(span * float(done) / float(total))
+                report_progress(progress, pct, "Evaluating existing screening UDRs", "{0} {1} ({2}/{3})".format(expr, label, done, total))
+                min_val = ""
+                max_val = ""
+                try:
+                    min_val = number_or_text(udr.Minimum)
+                except:
+                    pass
+                try:
+                    max_val = number_or_text(udr.Maximum)
+                except:
+                    pass
+                rows.append({
+                    "environment": env.name,
+                    "expression": expr,
+                    "screening_result": label,
+                    "source_udr": safe_name(udr),
+                    "location": node_selection_name(udr),
+                    "minimum": min_val,
+                    "maximum": max_val,
+                    "unit": result_unit(udr),
+                })
+    finally:
+        for key in states:
+            obj, state = states[key]
+            restore_state(obj, state)
     return rows
 
 
@@ -912,13 +2421,24 @@ def write_wide_all_csv(path, rows_by_bolt):
     write_text_file(path, lines)
 
 
-def build_manifest_rows(env, export_dir, output_mode, include_time_history, include_existing_screening, rows_by_bolt, summaries, existing_screening, unit_by_expr, log):
+def build_manifest_rows(env, export_dir, output_mode, include_time_history, include_existing_screening, use_tabular_beta, use_tabular_pane_beta, use_plotdata_beta, use_dpf_beta, use_dpf_joint_beta, rows_by_bolt, summaries, existing_screening, unit_by_expr, log):
     time_rows = 0
     for bolt in rows_by_bolt:
         time_rows += len(rows_by_bolt[bolt])
     summary_rows = 0
     for bolt in summaries:
         summary_rows += len(summaries[bolt])
+    extraction_method = "Scalar UDR Minimum/Maximum"
+    if use_tabular_beta:
+        extraction_method = "Tabular Data beta with scalar fallback"
+    if use_tabular_pane_beta:
+        extraction_method = "Fast Tabular Data pane beta"
+    if use_plotdata_beta:
+        extraction_method = "PlotData beta with scalar fallback"
+    if use_dpf_beta:
+        extraction_method = "DPF beta with scalar fallback"
+    if use_dpf_joint_beta:
+        extraction_method = "DPF joint reaction beta with scalar fallback"
     return [
         ["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["Environment", env.name],
@@ -930,6 +2450,29 @@ def build_manifest_rows(env, export_dir, output_mode, include_time_history, incl
         ["ExistingScreeningUDRCount", env.screening_udr_count()],
         ["TimeHistoryRequested", include_time_history],
         ["ExistingScreeningRequested", include_existing_screening],
+        ["ExtractionMethodRequested", extraction_method],
+        ["TabularDataBetaPreparedUDRs", log.tabular_prepared],
+        ["TabularDataBetaValuesRead", log.tabular_hits],
+        ["TabularDataBetaScalarFallbacks", log.tabular_fallbacks],
+        ["TabularDataBetaNote", "Beta mode evaluates each individual UDR once, reads the Mechanical Tabular Data time-history/combination Minimum/Maximum/Average rows directly, and falls back to scalar UDR Minimum/Maximum when the table is unavailable or cannot be aligned to result sets."],
+        ["TabularDataPaneBetaPreparedUDRs", log.tabular_pane_prepared],
+        ["TabularDataPaneBetaValuesRead", log.tabular_pane_hits],
+        ["TabularDataPaneBetaMisses", log.tabular_pane_fallbacks],
+        ["TabularDataPaneBetaNote", "Fast beta mode assumes evaluated results are already present, activates each individual UDR, scrapes the visible Tabular Data pane grid directly, reuses the first successful table layout for the remaining UDRs, and does not call EvaluateAllResults unless the fast precheck fails. Pane rows that cannot be read or aligned after a successful precheck are recorded as misses."],
+        ["PlotDataBetaPreparedUDRs", log.plotdata_prepared],
+        ["PlotDataBetaValuesRead", log.plotdata_hits],
+        ["PlotDataBetaScalarFallbacks", log.plotdata_fallbacks],
+        ["PlotDataBetaNote", "Beta mode evaluates each individual UDR once, reads PlotData['Values'] while stepping result sets, and falls back to scalar UDR Minimum/Maximum when PlotData is unavailable or nonnumeric."],
+        ["DPFBetaPrepared", log.dpf_prepared],
+        ["DPFBetaValuesRead", log.dpf_hits],
+        ["DPFBetaScalarFallbacks", log.dpf_fallbacks],
+        ["DPFJointBetaValuesRead", log.dpf_joint_hits],
+        ["DPFJointBetaScalarFallbacks", log.dpf_joint_fallbacks],
+        ["DPFJointBetaScopedNodeMisses", log.dpf_joint_node_misses],
+        ["DPFJointBetaCoordinateRequest", "bool_rotate_to_global=False, meaning native/joint result axes are requested when supported by the DPF server; verify axis/sign convention against Mechanical before relying on it."],
+        ["DPFBetaDisabledOperators", ";".join(log.dpf_disabled_ops)],
+        ["DPFBetaNote", "Beta mode reads ENFO components from DPF ENF/element_nodal_forces and tries ENMO components from DPF M/nodal_moment. If a DPF source operator is not registered, that operator is disabled after the first failure and scalar UDR fallback is used for the remaining values."],
+        ["DPFJointBetaNote", "Beta mode reads JFL/joint_force_reaction and JML/joint_moment_reaction for the scoped bolt nodes with bool_rotate_to_global=False. A DPF joint value is used only when the scoped node appears in the joint reaction field; otherwise scalar UDR fallback is used. Joint reactions are not assumed to be identical to ENFO/ENMO and should be compared before production use."],
         ["WideQuantityColumns", ";".join(WIDE_VALUE_COLUMNS)],
         ["RawQuantityColumns", ";".join(EXPRESSIONS)],
         ["DerivedQuantityColumns", ";".join(DERIVED_QUANTITIES)],
@@ -1105,10 +2648,21 @@ def format_sheet_finish(ws):
     freeze_top_row(ws)
 
 
-def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log):
+def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log, progress=None, start_percent=86, end_percent=97):
     excel_type = System.Type.GetTypeFromProgID("Excel.Application")
     if excel_type is None:
         raise Exception("Microsoft Excel COM automation is not available.")
+    sheet_total = 6 + len(rows_by_bolt.keys())
+    if existing_screening:
+        sheet_total += 1
+    nonlocal_sheet_done = [0]
+    report_progress(progress, start_percent, "Opening Microsoft Excel", "Creating workbook.")
+
+    def sheet_progress(name):
+        nonlocal_sheet_done[0] += 1
+        pct = start_percent + int(float(end_percent - start_percent) * float(nonlocal_sheet_done[0]) / float(max(1, sheet_total)))
+        report_progress(progress, pct, "Writing Excel workbook", "Sheet: {0} ({1}/{2})".format(name, nonlocal_sheet_done[0], sheet_total))
+
     excel = System.Activator.CreateInstance(excel_type)
     excel.Visible = False
     excel.DisplayAlerts = False
@@ -1140,16 +2694,19 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
                 ])
         write_table_to_sheet(ws, 1, 1, ["Environment", "Bolt", "Quantity", "QuantityType", "Unit", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep", "SampleCount"], summary_rows)
         format_sheet_finish(ws)
+        sheet_progress("Summary")
 
         ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
         ws.Name = sanitize_sheet_name("Tidy_Data", used_names)
         write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time", "Quantity", "QuantityType", "Value", "Unit", "Notes"], iter_tidy_rows(rows_by_bolt, unit_by_expr))
         format_sheet_finish(ws)
+        sheet_progress("Tidy_Data")
 
         ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
         ws.Name = sanitize_sheet_name("Wide_All_Bolts", used_names)
         write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time"] + WIDE_VALUE_COLUMNS + ["Notes"], iter_wide_rows(rows_by_bolt))
         format_sheet_finish(ws)
+        sheet_progress("Wide_All_Bolts")
 
         ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
         ws.Name = sanitize_sheet_name("Units", used_names)
@@ -1168,6 +2725,7 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
             unit_rows.append([quantity, quantity_type(quantity), quantity_unit(quantity, unit_by_expr), definitions.get(quantity, "Direct Mechanical User Defined Result value")])
         write_table_to_sheet(ws, 1, 1, ["Quantity", "QuantityType", "Unit", "Definition"], unit_rows)
         format_sheet_finish(ws)
+        sheet_progress("Units")
 
         for bolt in sorted(rows_by_bolt.keys()):
             ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
@@ -1197,6 +2755,7 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
                 ])
             write_table_to_sheet(ws, next_row, 1, ["Quantity", "QuantityType", "Unit", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep", "SampleCount"], screen_rows)
             format_sheet_finish(ws)
+            sheet_progress("Bolt_" + bolt)
 
         if existing_screening:
             ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
@@ -1215,18 +2774,22 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
                 ])
             write_table_to_sheet(ws, 1, 1, ["Environment", "Quantity", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"], data_rows)
             format_sheet_finish(ws)
+            sheet_progress("Existing_Screening")
 
         ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
         ws.Name = sanitize_sheet_name("Meta", used_names)
         write_table_to_sheet(ws, 1, 1, ["Field", "Value"], manifest_rows)
         format_sheet_finish(ws)
+        sheet_progress("Meta")
 
         ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
         ws.Name = sanitize_sheet_name("Log", used_names)
         for i, line in enumerate(log.lines):
             set_cell(ws, i + 1, 1, line)
         format_sheet_finish(ws)
+        sheet_progress("Log")
 
+        report_progress(progress, end_percent, "Saving Excel workbook", path)
         wb.SaveAs(path, 51)
     finally:
         if wb is not None:
@@ -1251,6 +2814,107 @@ def default_output_folder():
     return System.IO.Path.Combine(desktop, "bolt_result_exports")
 
 
+class ExportProgressForm(Form):
+    def __init__(self):
+        self.last_line = ""
+        self.cancel_requested = False
+        self.tooltip = ToolTip()
+
+        self.Text = "Exporting Bolt Results"
+        self.Size = Size(620, 300)
+        self.MinimumSize = Size(620, 300)
+        self.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        self.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
+        self.MaximizeBox = False
+        self.MinimizeBox = False
+        self.ControlBox = False
+        self.TopMost = True
+
+        title = Label()
+        title.Text = "Exporting bolt ENFO/ENMO results"
+        title.Location = Point(14, 14)
+        title.Size = Size(570, 22)
+        self.Controls.Add(title)
+
+        self.status_label = Label()
+        self.status_label.Text = "Preparing export..."
+        self.status_label.Location = Point(14, 44)
+        self.status_label.Size = Size(570, 22)
+        self.Controls.Add(self.status_label)
+
+        self.detail_label = Label()
+        self.detail_label.Text = ""
+        self.detail_label.Location = Point(14, 68)
+        self.detail_label.Size = Size(570, 34)
+        self.Controls.Add(self.detail_label)
+
+        self.bar = ProgressBar()
+        self.bar.Location = Point(14, 108)
+        self.bar.Size = Size(570, 22)
+        self.bar.Minimum = 0
+        self.bar.Maximum = 100
+        self.bar.Value = 0
+        self.Controls.Add(self.bar)
+
+        self.log_box = TextBox()
+        self.log_box.Location = Point(14, 140)
+        self.log_box.Size = Size(570, 70)
+        self.log_box.Multiline = True
+        self.log_box.ReadOnly = True
+        self.log_box.ScrollBars = ScrollBars.Vertical
+        self.log_box.BorderStyle = BorderStyle.FixedSingle
+        self.Controls.Add(self.log_box)
+
+        self.cancel_button = Button()
+        self.cancel_button.Text = "Cancel"
+        self.cancel_button.Location = Point(494, 220)
+        self.cancel_button.Size = Size(90, 28)
+        self.cancel_button.Click += self.on_cancel
+        attach_tip(self.tooltip, self.cancel_button, "Requests a cooperative stop. The exporter finishes the current Mechanical call, restores captured result state, and then exits.")
+        self.Controls.Add(self.cancel_button)
+        self.CancelButton = self.cancel_button
+
+    def on_cancel(self, sender, args):
+        self.cancel_requested = True
+        try:
+            self.cancel_button.Enabled = False
+            self.cancel_button.Text = "Stopping..."
+        except:
+            pass
+        try:
+            self.status_label.Text = "Cancelling export..."
+            self.detail_label.Text = "Waiting for the current Mechanical operation to finish."
+        except:
+            pass
+
+    def update(self, percent, status, detail=""):
+        try:
+            value = int(percent)
+        except:
+            value = 0
+        if value < 0:
+            value = 0
+        if value > 100:
+            value = 100
+        self.bar.Value = value
+        self.status_label.Text = safe_text(status)
+        self.detail_label.Text = safe_text(detail)
+        line = "{0}%  {1}".format(value, safe_text(status))
+        if detail:
+            line += " - " + safe_text(detail)
+        if line != self.last_line:
+            self.last_line = line
+            try:
+                self.log_box.AppendText(line + System.Environment.NewLine)
+            except:
+                pass
+        try:
+            self.Refresh()
+            Application.DoEvents()
+        except:
+            pass
+
+
 class ExportOptionsForm(Form):
     def __init__(self, environments):
         self.environments = environments
@@ -1259,14 +2923,19 @@ class ExportOptionsForm(Form):
         self.output_excel = False
         self.include_time_history = True
         self.include_existing_screening = True
+        self.use_tabular_beta = False
+        self.use_tabular_pane_beta = False
+        self.use_plotdata_beta = False
+        self.use_dpf_beta = False
+        self.use_dpf_joint_beta = False
         self.tooltip = ToolTip()
         self.tooltip.AutoPopDelay = 20000
         self.tooltip.InitialDelay = 350
         self.tooltip.ReshowDelay = 100
 
         self.Text = "Bolt ENFO/ENMO Result Exporter"
-        self.Size = Size(860, 690)
-        self.MinimumSize = Size(820, 650)
+        self.Size = Size(860, 860)
+        self.MinimumSize = Size(820, 830)
         self.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
 
         title = Label()
@@ -1342,7 +3011,7 @@ class ExportOptionsForm(Form):
         opt_group = GroupBox()
         opt_group.Text = "Extraction"
         opt_group.Location = Point(14, 392)
-        opt_group.Size = Size(815, 108)
+        opt_group.Size = Size(815, 250)
         self.Controls.Add(opt_group)
 
         self.history_check = CheckBox()
@@ -1361,26 +3030,80 @@ class ExportOptionsForm(Form):
         attach_tip(self.tooltip, self.screening_check, "Exports the already-created screening UDRs under 'Bolt Results - Max/Min Screening'. The script also computes its own per-bolt max/min summary from the individual bolt data.")
         opt_group.Controls.Add(self.screening_check)
 
+        self.show_beta_options_check = CheckBox()
+        self.show_beta_options_check.Text = "Show beta extraction options"
+        self.show_beta_options_check.Location = Point(18, 84)
+        self.show_beta_options_check.Size = Size(260, 24)
+        self.show_beta_options_check.Checked = False
+        self.show_beta_options_check.CheckedChanged += self.on_show_beta_options_changed
+        attach_tip(self.tooltip, self.show_beta_options_check, "Reveals experimental extraction paths. Keep this unchecked for the conservative scalar UDR export path. When this is turned off, all beta selections are cleared so a hidden beta extractor cannot run accidentally.")
+        opt_group.Controls.Add(self.show_beta_options_check)
+
+        self.tabular_beta_check = CheckBox()
+        self.tabular_beta_check.Text = "Beta: read Tabular Data all sets at once, fallback to scalar"
+        self.tabular_beta_check.Location = Point(18, 112)
+        self.tabular_beta_check.Size = Size(520, 24)
+        self.tabular_beta_check.Checked = False
+        self.tabular_beta_check.Visible = False
+        attach_tip(self.tooltip, self.tabular_beta_check, "Experimental speed option for Static/Transient Structural-style UDR tables. The exporter evaluates each individual bolt UDR once, reads the Tabular Data Minimum/Maximum/Average rows for all result sets, and falls back to scalar evaluation if the table is unavailable or cannot be aligned.")
+        opt_group.Controls.Add(self.tabular_beta_check)
+
+        self.tabular_pane_beta_check = CheckBox()
+        self.tabular_pane_beta_check.Text = "Beta: fast scrape Tabular Data pane all sets"
+        self.tabular_pane_beta_check.Location = Point(18, 140)
+        self.tabular_pane_beta_check.Size = Size(540, 24)
+        self.tabular_pane_beta_check.Checked = False
+        self.tabular_pane_beta_check.Visible = False
+        attach_tip(self.tooltip, self.tabular_pane_beta_check, "Fast pane scrape. Assumes evaluated results are already present, activates each individual bolt UDR, reads the visible Tabular Data pane grid directly, reuses the first successful table layout, and records pane-read failures as misses after a successful precheck.")
+        opt_group.Controls.Add(self.tabular_pane_beta_check)
+
+        self.plotdata_beta_check = CheckBox()
+        self.plotdata_beta_check.Text = "Beta: try PlotData fast path, fallback to scalar evaluation"
+        self.plotdata_beta_check.Location = Point(18, 168)
+        self.plotdata_beta_check.Size = Size(430, 24)
+        self.plotdata_beta_check.Checked = False
+        self.plotdata_beta_check.Visible = False
+        attach_tip(self.tooltip, self.plotdata_beta_check, "Experimental speed option. The exporter evaluates each individual bolt UDR once, then tries to read PlotData['Values'] after changing result set/load combination. If PlotData is unavailable, empty, or nonnumeric, that value falls back to the original EvaluateAllResults plus Minimum/Maximum method. Use this for comparison runs before trusting it in production.")
+        opt_group.Controls.Add(self.plotdata_beta_check)
+
+        self.dpf_beta_check = CheckBox()
+        self.dpf_beta_check.Text = "Beta: try DPF ENF/M fast path, fallback to scalar evaluation"
+        self.dpf_beta_check.Location = Point(18, 196)
+        self.dpf_beta_check.Size = Size(450, 24)
+        self.dpf_beta_check.Checked = False
+        self.dpf_beta_check.Visible = False
+        attach_tip(self.tooltip, self.dpf_beta_check, "Experimental DPF option. For normal analysis result files, the exporter tries mech_dpf plus DPF's ENF/element_nodal_forces reader for ENFOX/ENFOY/ENFOZ and DPF's M/nodal_moment reader for ENMOX/ENMOY/ENMOZ. Values that cannot be read through DPF and solution combinations fall back to the original EvaluateAllResults plus Minimum/Maximum method. The manifest records DPF hits and fallbacks.")
+        opt_group.Controls.Add(self.dpf_beta_check)
+
+        self.dpf_joint_beta_check = CheckBox()
+        self.dpf_joint_beta_check.Text = "Beta: try DPF joint reactions, fallback to scalar evaluation"
+        self.dpf_joint_beta_check.Location = Point(18, 224)
+        self.dpf_joint_beta_check.Size = Size(500, 24)
+        self.dpf_joint_beta_check.Checked = False
+        self.dpf_joint_beta_check.Visible = False
+        attach_tip(self.tooltip, self.dpf_joint_beta_check, "Experimental joint-reaction option. For normal analysis result files, the exporter tries DPF's JFL/joint_force_reaction for ENFOX/Y/Z and JML/joint_moment_reaction for ENMOX/Y/Z on the scoped bolt node IDs. A DPF joint value is accepted only when the scoped node appears in the joint reaction field; otherwise that value falls back to the original scalar UDR evaluation. The DPF call uses bool_rotate_to_global=False to preserve native/joint axes when supported. Joint reactions are not assumed to be identical to ENFO/ENMO, so compare this beta output before using it as a production replacement.")
+        opt_group.Controls.Add(self.dpf_joint_beta_check)
+
         note = Label()
-        note.Text = "Derived values include total force/moment and all X/Y/Z axial shear candidates. No single bolt axial direction is assumed."
+        note.Text = "Derived values include total force/moment and all X/Y/Z axial shear candidates. No single bolt axial direction is assumed. Beta extraction hit/fallback counts are logged in the manifest."
         note.Location = Point(456, 28)
-        note.Size = Size(340, 58)
+        note.Size = Size(340, 204)
         attach_tip(self.tooltip, note, "For differently oriented bolts, choose the ShearIf* column that matches that bolt's axial convention during your downstream hand calculation.")
         opt_group.Controls.Add(note)
 
         self.warning = TextBox()
-        self.warning.Location = Point(14, 512)
+        self.warning.Location = Point(14, 654)
         self.warning.Size = Size(815, 72)
         self.warning.Multiline = True
         self.warning.ReadOnly = True
         self.warning.BorderStyle = BorderStyle.FixedSingle
-        self.warning.Text = "This script changes Calculate Time History to Yes on the selected bolt UDRs when the property is writable. It does not save the project automatically. CSV and Excel exports include both wide hand-review tables and tidy postprocessing tables."
+        self.warning.Text = "This script changes Calculate Time History to Yes on the selected bolt UDRs when the property is writable. It does not save the project automatically. Beta extractors are experimental and record hits/fallbacks in the manifest/log."
         attach_tip(self.tooltip, self.warning, "Operational note: read-only properties, missing result files, or unavailable result sets are logged in export_log.txt and in the Excel Log sheet.")
         self.Controls.Add(self.warning)
 
         ok = Button()
         ok.Text = "Export"
-        ok.Location = Point(638, 600)
+        ok.Location = Point(638, 758)
         ok.Size = Size(90, 30)
         ok.Click += self.on_export
         attach_tip(self.tooltip, ok, "Run the export after validating the selected environment, output folder, Excel availability, and missing component warnings.")
@@ -1388,7 +3111,7 @@ class ExportOptionsForm(Form):
 
         cancel = Button()
         cancel.Text = "Cancel"
-        cancel.Location = Point(738, 600)
+        cancel.Location = Point(738, 758)
         cancel.Size = Size(90, 30)
         cancel.Click += self.on_cancel
         attach_tip(self.tooltip, cancel, "Close without exporting or changing result settings.")
@@ -1396,7 +3119,29 @@ class ExportOptionsForm(Form):
 
         self.AcceptButton = ok
         self.CancelButton = cancel
+        self.update_beta_options_visibility()
         self.on_selection_changed(None, None)
+
+    def on_show_beta_options_changed(self, sender, args):
+        self.update_beta_options_visibility()
+
+    def update_beta_options_visibility(self):
+        show = False
+        try:
+            show = bool(self.show_beta_options_check.Checked)
+        except:
+            show = False
+        self.tabular_beta_check.Visible = show
+        self.tabular_pane_beta_check.Visible = show
+        self.plotdata_beta_check.Visible = show
+        self.dpf_beta_check.Visible = show
+        self.dpf_joint_beta_check.Visible = show
+        if not show:
+            self.tabular_beta_check.Checked = False
+            self.tabular_pane_beta_check.Checked = False
+            self.plotdata_beta_check.Checked = False
+            self.dpf_beta_check.Checked = False
+            self.dpf_joint_beta_check.Checked = False
 
     def on_selection_changed(self, sender, args):
         idx = self.combo.SelectedIndex
@@ -1413,6 +3158,35 @@ class ExportOptionsForm(Form):
                 self.screening_check.Checked = True
                 self.screening_check.Text = "Also export existing Max/Min Screening UDR values"
                 attach_tip(self.tooltip, self.screening_check, "Exports the already-created screening UDRs under 'Bolt Results - Max/Min Screening'. The script also computes its own per-bolt max/min summary from the individual bolt data.")
+            if env.category == "SolutionCombination":
+                self.tabular_beta_check.Enabled = True
+                self.tabular_beta_check.Text = "Beta: try Tabular Data combination rows, fallback to scalar"
+                attach_tip(self.tooltip, self.tabular_beta_check, "Experimental path for solution combinations. It is used only if Mechanical exposes one readable tabular row per combination; otherwise each value falls back to the scalar UDR method.")
+                self.tabular_pane_beta_check.Enabled = True
+                self.tabular_pane_beta_check.Text = "Beta: fast scrape Tabular Data pane combination rows"
+                attach_tip(self.tooltip, self.tabular_pane_beta_check, "Fast pane scrape. Assumes evaluated results are already present and uses one fixed layout inferred from the first successful pane read. It is used only if the pane exposes one readable row per load combination; otherwise affected values are recorded as pane misses after a successful precheck.")
+                self.dpf_beta_check.Checked = False
+                self.dpf_beta_check.Enabled = False
+                self.dpf_beta_check.Text = "Beta DPF unavailable for solution combinations"
+                attach_tip(self.tooltip, self.dpf_beta_check, "DPF reads solver result files directly. Mechanical solution combinations are evaluated by Mechanical's result-combination machinery, so this option is disabled here and the scalar UDR path remains the reliable method.")
+                self.dpf_joint_beta_check.Checked = False
+                self.dpf_joint_beta_check.Enabled = False
+                self.dpf_joint_beta_check.Text = "Beta DPF joint unavailable for solution combinations"
+                attach_tip(self.tooltip, self.dpf_joint_beta_check, "DPF joint reactions read base solver result files directly. Mechanical solution combinations are evaluated by Mechanical's result-combination machinery, so this option is disabled here and the scalar UDR path remains the reliable method.")
+            else:
+                self.tabular_beta_check.Enabled = True
+                self.tabular_beta_check.Text = "Beta: read Tabular Data all sets at once, fallback to scalar"
+                attach_tip(self.tooltip, self.tabular_beta_check, "Experimental speed option for Static/Transient Structural-style UDR tables. The exporter evaluates each individual bolt UDR once, reads the Tabular Data Minimum/Maximum/Average rows for all result sets, and falls back to scalar evaluation if the table is unavailable or cannot be aligned.")
+                self.tabular_pane_beta_check.Enabled = True
+                self.tabular_pane_beta_check.Text = "Beta: fast scrape Tabular Data pane all sets"
+                attach_tip(self.tooltip, self.tabular_pane_beta_check, "Fast pane scrape. Assumes evaluated results are already present, activates each UDR, reads the visible Tabular Data pane grid directly, reuses the first successful table layout, and records pane-read failures as misses after a successful precheck.")
+                self.dpf_beta_check.Enabled = True
+                self.dpf_beta_check.Text = "Beta: try DPF ENF/M fast path, fallback to scalar evaluation"
+                attach_tip(self.tooltip, self.dpf_beta_check, "Experimental DPF option. For normal analysis result files, the exporter tries mech_dpf plus DPF's ENF/element_nodal_forces reader for ENFOX/ENFOY/ENFOZ and DPF's M/nodal_moment reader for ENMOX/ENMOY/ENMOZ. Values that cannot be read through DPF fall back to the original EvaluateAllResults plus Minimum/Maximum method. The manifest records DPF hits and fallbacks.")
+                self.dpf_joint_beta_check.Enabled = True
+                self.dpf_joint_beta_check.Text = "Beta: try DPF joint reactions, fallback to scalar evaluation"
+                attach_tip(self.tooltip, self.dpf_joint_beta_check, "Experimental joint-reaction option. The exporter tries DPF's JFL/joint_force_reaction and JML/joint_moment_reaction on the scoped bolt node IDs. Values are accepted only when DPF returns data for those nodes; otherwise scalar UDR fallback is used. This is useful for comparison when the bolt nodes are joint solver nodes, but it is not assumed to be the same as ENFO/ENMO.")
+            self.update_beta_options_visibility()
 
     def on_browse(self, sender, args):
         dlg = FolderBrowserDialog()
@@ -1457,11 +3231,35 @@ class ExportOptionsForm(Form):
             )
             self.csv_radio.Checked = True
             return
+        beta_count = 0
+        if bool(self.tabular_beta_check.Checked):
+            beta_count += 1
+        if bool(self.tabular_pane_beta_check.Checked):
+            beta_count += 1
+        if bool(self.plotdata_beta_check.Checked):
+            beta_count += 1
+        if bool(self.dpf_beta_check.Checked):
+            beta_count += 1
+        if bool(self.dpf_joint_beta_check.Checked):
+            beta_count += 1
+        if beta_count > 1:
+            MessageBox.Show(
+                "Select only one beta extraction method at a time.\n\nRun separate exports if you want to compare Tabular Data, Tabular Data pane, PlotData, DPF ENF/M, and DPF joint reaction beta paths.",
+                "Bolt Export",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning,
+            )
+            return
         self.selected_environment = env
         self.output_folder = folder
         self.output_excel = bool(self.xlsx_radio.Checked)
         self.include_time_history = bool(self.history_check.Checked)
         self.include_existing_screening = bool(self.screening_check.Checked)
+        self.use_tabular_beta = bool(self.tabular_beta_check.Checked)
+        self.use_tabular_pane_beta = bool(self.tabular_pane_beta_check.Checked)
+        self.use_plotdata_beta = bool(self.plotdata_beta_check.Checked)
+        self.use_dpf_beta = bool(self.dpf_beta_check.Checked)
+        self.use_dpf_joint_beta = bool(self.dpf_joint_beta_check.Checked)
         self.DialogResult = DialogResult.OK
         self.Close()
 
@@ -1470,7 +3268,8 @@ class ExportOptionsForm(Form):
         self.Close()
 
 
-def run_export(env, parent_folder, output_excel, include_time_history, include_existing_screening, log):
+def run_export(env, parent_folder, output_excel, include_time_history, include_existing_screening, use_tabular_beta, use_tabular_pane_beta, use_plotdata_beta, use_dpf_beta, use_dpf_joint_beta, log, progress=None):
+    report_progress(progress, 1, "Preparing export", "Creating output folder.")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_env = sanitize_file_name(env.name)
     export_dir = System.IO.Path.Combine(parent_folder, "bolt_export_{0}_{1}".format(safe_env, timestamp))
@@ -1478,18 +3277,33 @@ def run_export(env, parent_folder, output_excel, include_time_history, include_e
     log.info("Output directory: " + export_dir)
     log.info("Selected environment: " + env.summary())
 
+    report_progress(progress, 4, "Configuring result objects", "Setting Calculate Time History to Yes where Mechanical allows it.")
+    check_cancel(progress)
     set_calculate_time_history(env, log)
-    rows_by_bolt, unit_by_expr = extract_individual_rows(env, include_time_history, log)
+    check_cancel(progress)
+    rows_by_bolt, unit_by_expr = extract_individual_rows(env, include_time_history, log, progress, 10, 75, use_tabular_beta, use_tabular_pane_beta, use_plotdata_beta, use_dpf_beta, use_dpf_joint_beta)
+    check_cancel(progress)
+    report_progress(progress, 76, "Computing derived values", "Calculating totals, shear candidates, and per-bolt max/min summaries.")
     summaries = compute_screening(rows_by_bolt)
     existing_screening = []
     if include_existing_screening:
-        existing_screening = extract_existing_screening(env, log)
+        check_cancel(progress)
+        existing_screening = extract_existing_screening(env, log, progress, 79, 84)
+        report_progress(progress, 84, "Existing screening evaluation complete", "{0} screening rows collected.".format(len(existing_screening)))
+    else:
+        report_progress(progress, 84, "Skipping existing screening UDRs", "Only computed screening summaries will be written.")
+    report_progress(progress, 85, "Building manifest", "Collecting export metadata.")
     manifest_rows = build_manifest_rows(
         env,
         export_dir,
         "Excel" if output_excel else "CSV",
         include_time_history,
         include_existing_screening,
+        use_tabular_beta,
+        use_tabular_pane_beta,
+        use_plotdata_beta,
+        use_dpf_beta,
+        use_dpf_joint_beta,
         rows_by_bolt,
         summaries,
         existing_screening,
@@ -1500,10 +3314,13 @@ def run_export(env, parent_folder, output_excel, include_time_history, include_e
     if output_excel:
         workbook = System.IO.Path.Combine(export_dir, "bolt_results_{0}.xlsx".format(safe_env))
         try:
-            write_excel(workbook, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log)
+            write_excel(workbook, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log, progress, 86, 97)
             log.info("Wrote Excel workbook: " + workbook)
+        except ExportCancelledException:
+            raise
         except Exception as exc:
             log.warn("Excel export failed; writing CSV fallback. Reason: " + safe_text(exc))
+            report_progress(progress, 86, "Excel failed; writing CSV fallback", safe_text(exc))
             output_excel = False
             manifest_rows = build_manifest_rows(
                 env,
@@ -1511,6 +3328,11 @@ def run_export(env, parent_folder, output_excel, include_time_history, include_e
                 "CSV fallback after Excel failure",
                 include_time_history,
                 include_existing_screening,
+                use_tabular_beta,
+                use_tabular_pane_beta,
+                use_plotdata_beta,
+                use_dpf_beta,
+                use_dpf_joint_beta,
                 rows_by_bolt,
                 summaries,
                 existing_screening,
@@ -1519,27 +3341,56 @@ def run_export(env, parent_folder, output_excel, include_time_history, include_e
             )
 
     if not output_excel:
-        for bolt in sorted(rows_by_bolt.keys()):
+        bolt_keys = sorted(rows_by_bolt.keys())
+        csv_total = len(bolt_keys) + 5
+        if include_existing_screening:
+            csv_total += 1
+        csv_done = [0]
+
+        def csv_progress(name):
+            csv_done[0] += 1
+            pct = 86 + int(11.0 * float(csv_done[0]) / float(max(1, csv_total)))
+            report_progress(progress, pct, "Writing CSV files", "{0} ({1}/{2})".format(name, csv_done[0], csv_total))
+
+        for bolt in bolt_keys:
+            check_cancel(progress)
             path = System.IO.Path.Combine(export_dir, "bolt_{0}.csv".format(sanitize_file_name(bolt)))
             write_bolt_csv(path, env, bolt, rows_by_bolt[bolt], summaries.get(bolt, []), unit_by_expr)
             log.info("Wrote " + path)
+            csv_progress("bolt_{0}.csv".format(sanitize_file_name(bolt)))
+        check_cancel(progress)
         write_wide_all_csv(System.IO.Path.Combine(export_dir, "wide_all_bolts.csv"), rows_by_bolt)
+        csv_progress("wide_all_bolts.csv")
+        check_cancel(progress)
         write_tidy_csv(System.IO.Path.Combine(export_dir, "tidy_bolt_results.csv"), rows_by_bolt, unit_by_expr)
+        csv_progress("tidy_bolt_results.csv")
+        check_cancel(progress)
         write_units_csv(System.IO.Path.Combine(export_dir, "units_and_definitions.csv"), unit_by_expr)
+        csv_progress("units_and_definitions.csv")
+        check_cancel(progress)
         write_summary_csv(System.IO.Path.Combine(export_dir, "computed_screening_summary.csv"), env, summaries, unit_by_expr)
+        csv_progress("computed_screening_summary.csv")
         if include_existing_screening:
+            check_cancel(progress)
             write_existing_screening_csv(System.IO.Path.Combine(export_dir, "existing_screening_udr_values.csv"), existing_screening)
+            csv_progress("existing_screening_udr_values.csv")
+        check_cancel(progress)
         write_manifest_csv(System.IO.Path.Combine(export_dir, "manifest.csv"), manifest_rows)
+        csv_progress("manifest.csv")
 
+    check_cancel(progress)
+    report_progress(progress, 98, "Writing export log", "export_log.txt")
     write_log(System.IO.Path.Combine(export_dir, "export_log.txt"), log)
     time_rows = 0
     for bolt in rows_by_bolt:
         time_rows += len(rows_by_bolt[bolt])
+    report_progress(progress, 100, "Export complete", export_dir)
     return export_dir, len(rows_by_bolt.keys()), time_rows, log.warnings
 
 
 def main():
     log = LogBook()
+    progress = None
     try:
         envs = discover_environments(log)
         if not envs:
@@ -1555,14 +3406,28 @@ def main():
         if form.ShowDialog() != DialogResult.OK:
             return
 
+        progress = ExportProgressForm()
+        progress.Show()
+        report_progress(progress, 0, "Starting export", "Mechanical may pause briefly inside each result evaluation call.")
         export_dir, bolt_count, time_rows, warnings = run_export(
             form.selected_environment,
             form.output_folder,
             form.output_excel,
             form.include_time_history,
             form.include_existing_screening,
+            form.use_tabular_beta,
+            form.use_tabular_pane_beta,
+            form.use_plotdata_beta,
+            form.use_dpf_beta,
+            form.use_dpf_joint_beta,
             log,
+            progress,
         )
+        try:
+            progress.Close()
+        except:
+            pass
+        progress = None
 
         MessageBox.Show(
             "Export complete.\n\nFolder:\n{0}\n\nBolts exported: {1}\nTime-history rows: {2}\nWarnings: {3}\n\nReview manifest and export_log for details.".format(export_dir, bolt_count, time_rows, warnings),
@@ -1570,7 +3435,25 @@ def main():
             MessageBoxButtons.OK,
             MessageBoxIcon.Information,
         )
+    except ExportCancelledException:
+        log.info("Export cancelled by user.")
+        if progress is not None:
+            try:
+                progress.Close()
+            except:
+                pass
+        MessageBox.Show(
+            "Export cancelled.\n\nThe exporter stopped after the current Mechanical operation returned. Captured result-set state was restored for extraction loops.",
+            "Bolt Export",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Information,
+        )
     except Exception as exc:
+        if progress is not None:
+            try:
+                progress.Close()
+            except:
+                pass
         detail = traceback.format_exc()
         try:
             fallback = default_output_folder()

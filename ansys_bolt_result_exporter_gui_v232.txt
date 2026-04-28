@@ -1,5 +1,7 @@
 # ANSYS Mechanical v232 IronPython script
 # Bolt ENFO/ENMO result exporter with a Windows Forms GUI.
+# Exports wide hand-review tables, tidy postprocessing tables, manifest data,
+# existing screening UDR values, and conservative derived resultant/shear values.
 #
 # Copy-paste this whole file into the Mechanical scripting console.
 # It expects bolt UDR folders produced with names like:
@@ -37,6 +39,7 @@ from System.Windows.Forms import (
     RadioButton,
     ScrollBars,
     TextBox,
+    ToolTip,
 )
 
 from Ansys.Mechanical.DataModel.Enums import DataModelObjectCategory
@@ -48,6 +51,19 @@ except:
 
 
 EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ", "ENMOX", "ENMOY", "ENMOZ"]
+FORCE_EXPRESSIONS = ["ENFOX", "ENFOY", "ENFOZ"]
+MOMENT_EXPRESSIONS = ["ENMOX", "ENMOY", "ENMOZ"]
+DERIVED_QUANTITIES = [
+    "ForceTotal",
+    "MomentTotal",
+    "ShearIfXAxial",
+    "ShearIfYAxial",
+    "ShearIfZAxial",
+    "MomentShearIfXAxial",
+    "MomentShearIfYAxial",
+    "MomentShearIfZAxial",
+]
+WIDE_VALUE_COLUMNS = EXPRESSIONS + DERIVED_QUANTITIES
 INDIVIDUAL_ROOT = "Bolt Results"
 SCREENING_ROOT = "Bolt Results - Max/Min Screening"
 SCREENING_LABELS = [
@@ -240,6 +256,50 @@ def number_or_text(value):
     return num
 
 
+def numeric_from_row(row, key):
+    try:
+        value = row["values"].get(key, "")
+    except:
+        return None
+    if isinstance(value, float):
+        return value
+    return first_number(value)
+
+
+def vector_magnitude(values):
+    total = 0.0
+    for value in values:
+        if value is None:
+            return ""
+        total += value * value
+    return math.sqrt(total)
+
+
+def compute_derived_values(values):
+    fx = first_number(values.get("ENFOX", ""))
+    fy = first_number(values.get("ENFOY", ""))
+    fz = first_number(values.get("ENFOZ", ""))
+    mx = first_number(values.get("ENMOX", ""))
+    my = first_number(values.get("ENMOY", ""))
+    mz = first_number(values.get("ENMOZ", ""))
+    return {
+        "ForceTotal": vector_magnitude([fx, fy, fz]),
+        "MomentTotal": vector_magnitude([mx, my, mz]),
+        "ShearIfXAxial": vector_magnitude([fy, fz]),
+        "ShearIfYAxial": vector_magnitude([fx, fz]),
+        "ShearIfZAxial": vector_magnitude([fx, fy]),
+        "MomentShearIfXAxial": vector_magnitude([my, mz]),
+        "MomentShearIfYAxial": vector_magnitude([mx, mz]),
+        "MomentShearIfZAxial": vector_magnitude([mx, my]),
+    }
+
+
+def derived_unit(quantity, unit_by_expr):
+    if quantity.startswith("Moment"):
+        return unit_by_expr.get("ENMOX", unit_by_expr.get("ENMOY", unit_by_expr.get("ENMOZ", "")))
+    return unit_by_expr.get("ENFOX", unit_by_expr.get("ENFOY", unit_by_expr.get("ENFOZ", "")))
+
+
 def fmt_value(value):
     if value is None:
         return ""
@@ -273,6 +333,31 @@ def csv_line(values):
 def ensure_dir(path):
     if not System.IO.Directory.Exists(path):
         System.IO.Directory.CreateDirectory(path)
+
+
+def can_write_to_folder(path):
+    try:
+        ensure_dir(path)
+        test_path = System.IO.Path.Combine(path, "__bolt_export_write_test.tmp")
+        System.IO.File.WriteAllText(test_path, "ok")
+        System.IO.File.Delete(test_path)
+        return True, ""
+    except Exception as exc:
+        return False, safe_text(exc)
+
+
+def excel_is_available():
+    try:
+        return System.Type.GetTypeFromProgID("Excel.Application") is not None
+    except:
+        return False
+
+
+def attach_tip(tip, control, text):
+    try:
+        tip.SetToolTip(control, text)
+    except:
+        pass
 
 
 def sanitize_file_name(text):
@@ -361,14 +446,58 @@ class BoltEnvironment(object):
                         objects.append(self.screening[expr][label])
         return objects
 
+    def individual_udr_count(self):
+        count = 0
+        for bolt in self.individual:
+            count += len(self.individual[bolt].keys())
+        return count
+
+    def screening_udr_count(self):
+        count = 0
+        for expr in self.screening:
+            count += len(self.screening[expr].keys())
+        return count
+
+    def missing_components(self):
+        missing = []
+        for bolt in sorted(self.individual.keys()):
+            for expr in EXPRESSIONS:
+                if expr not in self.individual[bolt]:
+                    missing.append("Bolt {0}: {1}".format(bolt, expr))
+        return missing
+
+    def result_set_hint(self):
+        if self.category == "SolutionCombination":
+            try:
+                count = int(self.owner.Definition.LoadCombinationCount)
+                if count == 1:
+                    return "1 load combination will be exported."
+                return "{0} load combinations will be exported.".format(count)
+            except Exception as exc:
+                return "Load combination count is unavailable: " + safe_text(exc)
+        try:
+            data = self.owner.GetResultsData()
+            try:
+                if data is None:
+                    return "Result-set list is unavailable; export will use the current result state."
+                count = len(list(data.ListTimeFreq))
+                if count == 0:
+                    return "No result-set times were reported; export will use the current result state."
+                if count == 1:
+                    return "1 result set/time point will be exported."
+                return "{0} result sets/time points will be exported when time history is enabled.".format(count)
+            finally:
+                try:
+                    data.Dispose()
+                except:
+                    pass
+        except Exception as exc:
+            return "Result-set list is unavailable: " + safe_text(exc)
+
     def summary(self):
         bolt_count = len(self.individual.keys())
-        ind_count = 0
-        for bolt in self.individual:
-            ind_count += len(self.individual[bolt].keys())
-        screen_count = 0
-        for expr in self.screening:
-            screen_count += len(self.screening[expr].keys())
+        ind_count = self.individual_udr_count()
+        screen_count = self.screening_udr_count()
         return "{0} ({1}) - {2} bolts, {3} individual UDRs, {4} screening UDRs".format(
             self.name, self.category, bolt_count, ind_count, screen_count
         )
@@ -378,23 +507,26 @@ class BoltEnvironment(object):
         lines.append("Tree object: " + self.name)
         lines.append("Type: " + self.category)
         lines.append("Individual bolt IDs: " + ", ".join(sorted(self.individual.keys())))
-        lines.append("Individual UDRs: " + safe_text(sum([len(self.individual[b].keys()) for b in self.individual])))
-        lines.append("Screening UDRs: " + safe_text(sum([len(self.screening[e].keys()) for e in self.screening])))
+        lines.append("Individual UDRs: " + safe_text(self.individual_udr_count()))
+        lines.append("Existing screening UDRs: " + safe_text(self.screening_udr_count()))
+        lines.append("Result sets: " + self.result_set_hint())
+        if self.screening_udr_count() == 0:
+            lines.append("Screening availability: none found under '{0}'.".format(SCREENING_ROOT))
+        else:
+            lines.append("Screening availability: existing screening UDRs will be available as a separate table.")
         if self.individual_root is not None:
             lines.append("Individual root: " + tree_path(self.individual_root))
         if self.screening_root is not None:
             lines.append("Screening root: " + tree_path(self.screening_root))
-        missing = []
-        for bolt in sorted(self.individual.keys()):
-            for expr in EXPRESSIONS:
-                if expr not in self.individual[bolt]:
-                    missing.append("Bolt {0}: {1}".format(bolt, expr))
+        missing = self.missing_components()
         if missing:
             lines.append("")
             lines.append("Missing individual components:")
             lines.extend(missing[:12])
             if len(missing) > 12:
                 lines.append("... {0} more".format(len(missing) - 12))
+        else:
+            lines.append("Completeness: every discovered bolt has all six ENFO/ENMO components.")
         return "\r\n".join(lines)
 
 
@@ -614,6 +746,9 @@ def extract_individual_rows(env, include_time_history, log):
                     row["values"][expr] = value
                     if note:
                         row["notes"].append(note)
+                derived = compute_derived_values(row["values"])
+                for name in DERIVED_QUANTITIES:
+                    row["values"][name] = derived.get(name, "")
                 rows.append(row)
             rows_by_bolt[bolt] = rows
     finally:
@@ -629,7 +764,7 @@ def compute_screening(rows_by_bolt):
     for bolt in rows_by_bolt:
         rows = rows_by_bolt[bolt]
         summary = []
-        for expr in EXPRESSIONS:
+        for expr in WIDE_VALUE_COLUMNS:
             values = []
             for row in rows:
                 val = row["values"].get(expr, "")
@@ -648,6 +783,7 @@ def compute_screening(rows_by_bolt):
                     "time_of_min": "",
                     "max_step": "",
                     "min_step": "",
+                    "sample_count": 0,
                 })
                 continue
             max_row = max(values, key=lambda x: x[0])
@@ -660,6 +796,7 @@ def compute_screening(rows_by_bolt):
                 "min": min_row[0],
                 "time_of_min": min_row[1],
                 "min_step": min_row[2],
+                "sample_count": len(values),
             })
         summaries[bolt] = summary
     return summaries
@@ -709,66 +846,42 @@ def write_text_file(path, lines):
 
 def write_bolt_csv(path, env, bolt, rows, summary, unit_by_expr):
     lines = []
-    lines.append("# Bolt ENFO/ENMO export")
-    lines.append("# Environment,{0}".format(csv_escape(env.name)))
-    lines.append("# Environment Type,{0}".format(csv_escape(env.category)))
-    lines.append("# Bolt,{0}".format(csv_escape(bolt)))
-    if rows:
-        lines.append("# Node Named Selection,{0}".format(csv_escape(rows[0]["node_selection"])))
-    lines.append("# Generated,{0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    lines.append("")
-    lines.append("Units")
-    lines.append(csv_line(["Expression", "Unit"]))
-    for expr in EXPRESSIONS:
-        lines.append(csv_line([expr, unit_by_expr.get(expr, "")]))
-    lines.append("")
-    lines.append("Time History")
-    header = ["StepIndex", "StepLabel", "Time", "NodeSelection"] + EXPRESSIONS + ["Notes"]
+    header = ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time"] + WIDE_VALUE_COLUMNS + ["Notes"]
     lines.append(csv_line(header))
     for row in rows:
-        values = [row["step_index"], row["step_label"], row["time"], row["node_selection"]]
-        for expr in EXPRESSIONS:
+        values = [env.name, env.category, bolt, row["node_selection"], row["step_index"], row["step_label"], row["time"]]
+        for expr in WIDE_VALUE_COLUMNS:
             values.append(row["values"].get(expr, ""))
         values.append("; ".join(row["notes"]))
         lines.append(csv_line(values))
-    lines.append("")
-    lines.append("Computed Screening Summary")
-    lines.append(csv_line(["Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"]))
-    for item in summary:
-        lines.append(csv_line([
-            item["expression"],
-            item["max"],
-            item["time_of_max"],
-            item["max_step"],
-            item["min"],
-            item["time_of_min"],
-            item["min_step"],
-        ]))
     write_text_file(path, lines)
 
 
-def write_summary_csv(path, env, rows_by_bolt, summaries):
+def write_summary_csv(path, env, summaries, unit_by_expr):
     lines = []
-    lines.append(csv_line(["Environment", "Bolt", "Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"]))
+    lines.append(csv_line(["Environment", "Bolt", "Quantity", "QuantityType", "Unit", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep", "SampleCount"]))
     for bolt in sorted(summaries.keys()):
         for item in summaries[bolt]:
             lines.append(csv_line([
                 env.name,
                 bolt,
                 item["expression"],
+                quantity_type(item["expression"]),
+                quantity_unit(item["expression"], unit_by_expr),
                 item["max"],
                 item["time_of_max"],
                 item["max_step"],
                 item["min"],
                 item["time_of_min"],
                 item["min_step"],
+                item.get("sample_count", ""),
             ]))
     write_text_file(path, lines)
 
 
 def write_existing_screening_csv(path, rows):
     lines = []
-    lines.append(csv_line(["Environment", "Expression", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"]))
+    lines.append(csv_line(["Environment", "Quantity", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"]))
     for row in rows:
         lines.append(csv_line([
             row["environment"],
@@ -783,12 +896,153 @@ def write_existing_screening_csv(path, rows):
     write_text_file(path, lines)
 
 
+def write_tidy_csv(path, rows_by_bolt, unit_by_expr):
+    lines = []
+    lines.append(csv_line(["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time", "Quantity", "QuantityType", "Value", "Unit", "Notes"]))
+    for row in iter_tidy_rows(rows_by_bolt, unit_by_expr):
+        lines.append(csv_line(row))
+    write_text_file(path, lines)
+
+
+def write_wide_all_csv(path, rows_by_bolt):
+    lines = []
+    lines.append(csv_line(["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time"] + WIDE_VALUE_COLUMNS + ["Notes"]))
+    for row in iter_wide_rows(rows_by_bolt):
+        lines.append(csv_line(row))
+    write_text_file(path, lines)
+
+
+def build_manifest_rows(env, export_dir, output_mode, include_time_history, include_existing_screening, rows_by_bolt, summaries, existing_screening, unit_by_expr, log):
+    time_rows = 0
+    for bolt in rows_by_bolt:
+        time_rows += len(rows_by_bolt[bolt])
+    summary_rows = 0
+    for bolt in summaries:
+        summary_rows += len(summaries[bolt])
+    return [
+        ["Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["Environment", env.name],
+        ["EnvironmentType", env.category],
+        ["OutputMode", output_mode],
+        ["OutputDirectory", export_dir],
+        ["BoltCount", len(rows_by_bolt.keys())],
+        ["IndividualUDRCount", env.individual_udr_count()],
+        ["ExistingScreeningUDRCount", env.screening_udr_count()],
+        ["TimeHistoryRequested", include_time_history],
+        ["ExistingScreeningRequested", include_existing_screening],
+        ["WideQuantityColumns", ";".join(WIDE_VALUE_COLUMNS)],
+        ["RawQuantityColumns", ";".join(EXPRESSIONS)],
+        ["DerivedQuantityColumns", ";".join(DERIVED_QUANTITIES)],
+        ["TimeHistoryRowCount", time_rows],
+        ["ComputedSummaryRowCount", summary_rows],
+        ["ExistingScreeningRowCount", len(existing_screening)],
+        ["WarningCountAtManifestWrite", log.warnings],
+        ["CompletenessMissingComponents", len(env.missing_components())],
+        ["ShearAxisAssumption", "No single axial direction is assumed; all X/Y/Z axial shear candidates are exported."],
+    ]
+
+
+def write_manifest_csv(path, manifest_rows):
+    lines = [csv_line(["Field", "Value"])]
+    for row in manifest_rows:
+        lines.append(csv_line(row))
+    write_text_file(path, lines)
+
+
 def write_log(path, log):
     write_text_file(path, log.lines)
 
 
+def quantity_type(quantity):
+    if quantity in EXPRESSIONS:
+        return "Raw UDR"
+    if quantity in DERIVED_QUANTITIES:
+        return "Derived"
+    return "Other"
+
+
+def quantity_unit(quantity, unit_by_expr):
+    if quantity in EXPRESSIONS:
+        return unit_by_expr.get(quantity, "")
+    if quantity in DERIVED_QUANTITIES:
+        return derived_unit(quantity, unit_by_expr)
+    return ""
+
+
+def iter_wide_rows(rows_by_bolt):
+    rows = []
+    for bolt in sorted(rows_by_bolt.keys()):
+        for row in rows_by_bolt[bolt]:
+            values = [
+                row["environment"],
+                row["environment_type"],
+                bolt,
+                row["node_selection"],
+                row["step_index"],
+                row["step_label"],
+                row["time"],
+            ]
+            for name in WIDE_VALUE_COLUMNS:
+                values.append(row["values"].get(name, ""))
+            values.append("; ".join(row["notes"]))
+            rows.append(values)
+    return rows
+
+
+def iter_tidy_rows(rows_by_bolt, unit_by_expr):
+    rows = []
+    for bolt in sorted(rows_by_bolt.keys()):
+        for row in rows_by_bolt[bolt]:
+            for quantity in WIDE_VALUE_COLUMNS:
+                rows.append([
+                    row["environment"],
+                    row["environment_type"],
+                    bolt,
+                    row["node_selection"],
+                    row["step_index"],
+                    row["step_label"],
+                    row["time"],
+                    quantity,
+                    quantity_type(quantity),
+                    row["values"].get(quantity, ""),
+                    quantity_unit(quantity, unit_by_expr),
+                    "; ".join(row["notes"]),
+                ])
+    return rows
+
+
+def write_units_csv(path, unit_by_expr):
+    lines = []
+    lines.append(csv_line(["Quantity", "QuantityType", "Unit", "Definition"]))
+    definitions = {
+        "ForceTotal": "sqrt(ENFOX^2 + ENFOY^2 + ENFOZ^2)",
+        "MomentTotal": "sqrt(ENMOX^2 + ENMOY^2 + ENMOZ^2)",
+        "ShearIfXAxial": "sqrt(ENFOY^2 + ENFOZ^2); use only if local/global X is axial for that bolt",
+        "ShearIfYAxial": "sqrt(ENFOX^2 + ENFOZ^2); use only if local/global Y is axial for that bolt",
+        "ShearIfZAxial": "sqrt(ENFOX^2 + ENFOY^2); use only if local/global Z is axial for that bolt",
+        "MomentShearIfXAxial": "sqrt(ENMOY^2 + ENMOZ^2); use only if X is the relevant torsional axis",
+        "MomentShearIfYAxial": "sqrt(ENMOX^2 + ENMOZ^2); use only if Y is the relevant torsional axis",
+        "MomentShearIfZAxial": "sqrt(ENMOX^2 + ENMOY^2); use only if Z is the relevant torsional axis",
+    }
+    for quantity in WIDE_VALUE_COLUMNS:
+        lines.append(csv_line([
+            quantity,
+            quantity_type(quantity),
+            quantity_unit(quantity, unit_by_expr),
+            definitions.get(quantity, "Direct Mechanical User Defined Result value"),
+        ]))
+    write_text_file(path, lines)
+
+
 def set_cell(ws, row, col, value):
-    ws.Cells[row, col].Value2 = fmt_value(value)
+    if value is None:
+        ws.Cells[row, col].Value2 = ""
+    elif isinstance(value, bool):
+        ws.Cells[row, col].Value2 = safe_text(value)
+    elif isinstance(value, float) or isinstance(value, int):
+        ws.Cells[row, col].Value2 = value
+    else:
+        ws.Cells[row, col].Value2 = fmt_value(value)
 
 
 def write_table_to_sheet(ws, start_row, start_col, header, rows):
@@ -800,10 +1054,58 @@ def write_table_to_sheet(ws, start_row, start_col, header, rows):
         for c, value in enumerate(row):
             set_cell(ws, r, start_col + c, value)
         r += 1
+    format_excel_table(ws, start_row, start_col, len(rows) + 1, len(header))
+    for c, value in enumerate(header):
+        if safe_text(value) in ["Notes", "Definition", "Value"]:
+            try:
+                ws.Columns[start_col + c].WrapText = True
+            except:
+                pass
     return r
 
 
-def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, log):
+def format_excel_table(ws, start_row, start_col, row_count, col_count):
+    if row_count <= 0 or col_count <= 0:
+        return
+    try:
+        header = ws.Range(ws.Cells[start_row, start_col], ws.Cells[start_row, start_col + col_count - 1])
+        header.Font.Bold = True
+        header.Interior.Color = 15132390
+    except:
+        pass
+    try:
+        full_range = ws.Range(ws.Cells[start_row, start_col], ws.Cells[start_row + row_count - 1, start_col + col_count - 1])
+        full_range.AutoFilter()
+    except:
+        pass
+    try:
+        ws.Columns.AutoFit()
+    except:
+        pass
+
+
+def freeze_top_row(ws):
+    try:
+        ws.Activate()
+        ws.Application.ActiveWindow.SplitRow = 1
+        ws.Application.ActiveWindow.FreezePanes = True
+    except:
+        pass
+
+
+def format_sheet_finish(ws):
+    try:
+        ws.Columns.AutoFit()
+    except:
+        pass
+    try:
+        ws.Rows[1].Font.Bold = True
+    except:
+        pass
+    freeze_top_row(ws)
+
+
+def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log):
     excel_type = System.Type.GetTypeFromProgID("Excel.Application")
     if excel_type is None:
         raise Exception("Microsoft Excel COM automation is not available.")
@@ -826,58 +1128,75 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
                     env.name,
                     bolt,
                     item["expression"],
+                    quantity_type(item["expression"]),
+                    quantity_unit(item["expression"], unit_by_expr),
                     item["max"],
                     item["time_of_max"],
                     item["max_step"],
                     item["min"],
                     item["time_of_min"],
                     item["min_step"],
+                    item.get("sample_count", ""),
                 ])
-        write_table_to_sheet(ws, 1, 1, ["Environment", "Bolt", "Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"], summary_rows)
-        try:
-            ws.Columns.AutoFit()
-        except:
-            pass
+        write_table_to_sheet(ws, 1, 1, ["Environment", "Bolt", "Quantity", "QuantityType", "Unit", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep", "SampleCount"], summary_rows)
+        format_sheet_finish(ws)
+
+        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws.Name = sanitize_sheet_name("Tidy_Data", used_names)
+        write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time", "Quantity", "QuantityType", "Value", "Unit", "Notes"], iter_tidy_rows(rows_by_bolt, unit_by_expr))
+        format_sheet_finish(ws)
+
+        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws.Name = sanitize_sheet_name("Wide_All_Bolts", used_names)
+        write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time"] + WIDE_VALUE_COLUMNS + ["Notes"], iter_wide_rows(rows_by_bolt))
+        format_sheet_finish(ws)
+
+        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws.Name = sanitize_sheet_name("Units", used_names)
+        unit_rows = []
+        definitions = {
+            "ForceTotal": "sqrt(ENFOX^2 + ENFOY^2 + ENFOZ^2)",
+            "MomentTotal": "sqrt(ENMOX^2 + ENMOY^2 + ENMOZ^2)",
+            "ShearIfXAxial": "sqrt(ENFOY^2 + ENFOZ^2); use only if X is axial for that bolt",
+            "ShearIfYAxial": "sqrt(ENFOX^2 + ENFOZ^2); use only if Y is axial for that bolt",
+            "ShearIfZAxial": "sqrt(ENFOX^2 + ENFOY^2); use only if Z is axial for that bolt",
+            "MomentShearIfXAxial": "sqrt(ENMOY^2 + ENMOZ^2); use only if X is the relevant torsional axis",
+            "MomentShearIfYAxial": "sqrt(ENMOX^2 + ENMOZ^2); use only if Y is the relevant torsional axis",
+            "MomentShearIfZAxial": "sqrt(ENMOX^2 + ENMOY^2); use only if Z is the relevant torsional axis",
+        }
+        for quantity in WIDE_VALUE_COLUMNS:
+            unit_rows.append([quantity, quantity_type(quantity), quantity_unit(quantity, unit_by_expr), definitions.get(quantity, "Direct Mechanical User Defined Result value")])
+        write_table_to_sheet(ws, 1, 1, ["Quantity", "QuantityType", "Unit", "Definition"], unit_rows)
+        format_sheet_finish(ws)
 
         for bolt in sorted(rows_by_bolt.keys()):
             ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
             ws.Name = sanitize_sheet_name("Bolt_" + bolt, used_names)
-            set_cell(ws, 1, 1, "Environment")
-            set_cell(ws, 1, 2, env.name)
-            set_cell(ws, 2, 1, "Bolt")
-            set_cell(ws, 2, 2, bolt)
-            set_cell(ws, 3, 1, "Generated")
-            set_cell(ws, 3, 2, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            unit_rows = []
-            for expr in EXPRESSIONS:
-                unit_rows.append([expr, unit_by_expr.get(expr, "")])
-            next_row = write_table_to_sheet(ws, 5, 1, ["Expression", "Unit"], unit_rows)
-            next_row += 2
             hist_rows = []
             for row in rows_by_bolt[bolt]:
-                hist = [row["step_index"], row["step_label"], row["time"], row["node_selection"]]
-                for expr in EXPRESSIONS:
+                hist = [env.name, env.category, bolt, row["node_selection"], row["step_index"], row["step_label"], row["time"]]
+                for expr in WIDE_VALUE_COLUMNS:
                     hist.append(row["values"].get(expr, ""))
                 hist.append("; ".join(row["notes"]))
                 hist_rows.append(hist)
-            next_row = write_table_to_sheet(ws, next_row, 1, ["StepIndex", "StepLabel", "Time", "NodeSelection"] + EXPRESSIONS + ["Notes"], hist_rows)
+            next_row = write_table_to_sheet(ws, 1, 1, ["Environment", "EnvironmentType", "Bolt", "NodeSelection", "StepIndex", "StepLabel", "Time"] + WIDE_VALUE_COLUMNS + ["Notes"], hist_rows)
             next_row += 2
             screen_rows = []
             for item in summaries[bolt]:
                 screen_rows.append([
                     item["expression"],
+                    quantity_type(item["expression"]),
+                    quantity_unit(item["expression"], unit_by_expr),
                     item["max"],
                     item["time_of_max"],
                     item["max_step"],
                     item["min"],
                     item["time_of_min"],
                     item["min_step"],
+                    item.get("sample_count", ""),
                 ])
-            write_table_to_sheet(ws, next_row, 1, ["Expression", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep"], screen_rows)
-            try:
-                ws.Columns.AutoFit()
-            except:
-                pass
+            write_table_to_sheet(ws, next_row, 1, ["Quantity", "QuantityType", "Unit", "MaximumOverTime", "TimeOfMaximum", "MaxStep", "MinimumOverTime", "TimeOfMinimum", "MinStep", "SampleCount"], screen_rows)
+            format_sheet_finish(ws)
 
         if existing_screening:
             ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
@@ -894,20 +1213,19 @@ def write_excel(path, env, rows_by_bolt, summaries, existing_screening, unit_by_
                     row["maximum"],
                     row["unit"],
                 ])
-            write_table_to_sheet(ws, 1, 1, ["Environment", "Expression", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"], data_rows)
-            try:
-                ws.Columns.AutoFit()
-            except:
-                pass
+            write_table_to_sheet(ws, 1, 1, ["Environment", "Quantity", "ScreeningResult", "SourceUDR", "Location", "Minimum", "Maximum", "Unit"], data_rows)
+            format_sheet_finish(ws)
+
+        ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
+        ws.Name = sanitize_sheet_name("Meta", used_names)
+        write_table_to_sheet(ws, 1, 1, ["Field", "Value"], manifest_rows)
+        format_sheet_finish(ws)
 
         ws = wb.Worksheets.Add(None, wb.Worksheets[wb.Worksheets.Count])
         ws.Name = sanitize_sheet_name("Log", used_names)
         for i, line in enumerate(log.lines):
             set_cell(ws, i + 1, 1, line)
-        try:
-            ws.Columns.AutoFit()
-        except:
-            pass
+        format_sheet_finish(ws)
 
         wb.SaveAs(path, 51)
     finally:
@@ -941,42 +1259,48 @@ class ExportOptionsForm(Form):
         self.output_excel = False
         self.include_time_history = True
         self.include_existing_screening = True
+        self.tooltip = ToolTip()
+        self.tooltip.AutoPopDelay = 20000
+        self.tooltip.InitialDelay = 350
+        self.tooltip.ReshowDelay = 100
 
         self.Text = "Bolt ENFO/ENMO Result Exporter"
-        self.Size = Size(820, 610)
-        self.MinimumSize = Size(760, 560)
+        self.Size = Size(860, 690)
+        self.MinimumSize = Size(820, 650)
         self.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
 
         title = Label()
         title.Text = "Select the analysis or solution combination to export"
         title.Location = Point(14, 14)
-        title.Size = Size(760, 22)
+        title.Size = Size(820, 22)
         self.Controls.Add(title)
 
         self.combo = ComboBox()
         self.combo.Location = Point(14, 42)
-        self.combo.Size = Size(775, 26)
+        self.combo.Size = Size(815, 26)
         self.combo.DropDownStyle = ComboBoxStyle.DropDownList
         for env in environments:
             self.combo.Items.Add(env.summary())
         if len(environments) > 0:
             self.combo.SelectedIndex = 0
         self.combo.SelectedIndexChanged += self.on_selection_changed
+        attach_tip(self.tooltip, self.combo, "Choose the solved analysis or solution combination that owns the bolt ENFO/ENMO result folders. The summary shows discovered bolt count, individual UDR count, and existing screening UDR count.")
         self.Controls.Add(self.combo)
 
         self.detail = TextBox()
         self.detail.Location = Point(14, 78)
-        self.detail.Size = Size(775, 130)
+        self.detail.Size = Size(815, 170)
         self.detail.Multiline = True
         self.detail.ReadOnly = True
         self.detail.ScrollBars = ScrollBars.Vertical
         self.detail.BorderStyle = BorderStyle.FixedSingle
+        attach_tip(self.tooltip, self.detail, "Preflight summary for the selected tree object. Review missing components, screening availability, and expected result-set behavior before export.")
         self.Controls.Add(self.detail)
 
         out_group = GroupBox()
         out_group.Text = "Output"
-        out_group.Location = Point(14, 220)
-        out_group.Size = Size(775, 110)
+        out_group.Location = Point(14, 260)
+        out_group.Size = Size(815, 120)
         self.Controls.Add(out_group)
 
         out_label = Label()
@@ -987,77 +1311,87 @@ class ExportOptionsForm(Form):
 
         self.folder_box = TextBox()
         self.folder_box.Location = Point(72, 24)
-        self.folder_box.Size = Size(585, 24)
+        self.folder_box.Size = Size(625, 24)
         self.folder_box.Text = self.output_folder
+        attach_tip(self.tooltip, self.folder_box, "Parent folder for a timestamped export directory. The script checks that this folder can be created and written before export starts.")
         out_group.Controls.Add(self.folder_box)
 
         browse = Button()
         browse.Text = "Browse..."
-        browse.Location = Point(665, 22)
+        browse.Location = Point(705, 22)
         browse.Size = Size(90, 28)
         browse.Click += self.on_browse
+        attach_tip(self.tooltip, browse, "Open a folder picker for the parent export location.")
         out_group.Controls.Add(browse)
 
         self.csv_radio = RadioButton()
-        self.csv_radio.Text = "CSV folder: one file per bolt plus summary files"
+        self.csv_radio.Text = "CSV folder: per-bolt wide files, tidy data, manifest, summaries"
         self.csv_radio.Location = Point(72, 60)
-        self.csv_radio.Size = Size(330, 24)
+        self.csv_radio.Size = Size(430, 24)
         self.csv_radio.Checked = True
+        attach_tip(self.tooltip, self.csv_radio, "Writes plain CSV artifacts: one wide file per bolt for hand review, one all-bolts wide file, one tidy row-per-quantity file for pivots/scripts, units, manifest, computed screening summary, optional existing screening values, and log.")
         out_group.Controls.Add(self.csv_radio)
 
         self.xlsx_radio = RadioButton()
-        self.xlsx_radio.Text = "Excel workbook: one sheet per bolt (requires Microsoft Excel)"
-        self.xlsx_radio.Location = Point(410, 60)
-        self.xlsx_radio.Size = Size(350, 24)
+        self.xlsx_radio.Text = "Excel workbook: formatted report sheets (requires Microsoft Excel)"
+        self.xlsx_radio.Location = Point(72, 88)
+        self.xlsx_radio.Size = Size(520, 24)
+        attach_tip(self.tooltip, self.xlsx_radio, "Writes the same data to one formatted .xlsx workbook using Excel COM: Summary, Tidy_Data, Wide_All_Bolts, Units, per-bolt sheets, Meta, Log, and existing screening when available.")
         out_group.Controls.Add(self.xlsx_radio)
 
         opt_group = GroupBox()
         opt_group.Text = "Extraction"
-        opt_group.Location = Point(14, 342)
-        opt_group.Size = Size(775, 92)
+        opt_group.Location = Point(14, 392)
+        opt_group.Size = Size(815, 108)
         self.Controls.Add(opt_group)
 
         self.history_check = CheckBox()
         self.history_check.Text = "Export all result sets/time points when available"
         self.history_check.Location = Point(18, 28)
-        self.history_check.Size = Size(360, 24)
+        self.history_check.Size = Size(390, 24)
         self.history_check.Checked = True
+        attach_tip(self.tooltip, self.history_check, "When checked, the script attempts to step each UDR through all available result sets or load combinations. If result-set data is unavailable, it exports the current result state and logs the reason.")
         opt_group.Controls.Add(self.history_check)
 
         self.screening_check = CheckBox()
         self.screening_check.Text = "Also export existing Max/Min Screening UDR values"
         self.screening_check.Location = Point(18, 56)
-        self.screening_check.Size = Size(400, 24)
+        self.screening_check.Size = Size(430, 24)
         self.screening_check.Checked = True
+        attach_tip(self.tooltip, self.screening_check, "Exports the already-created screening UDRs under 'Bolt Results - Max/Min Screening'. The script also computes its own per-bolt max/min summary from the individual bolt data.")
         opt_group.Controls.Add(self.screening_check)
 
         note = Label()
-        note.Text = "The script also computes per-bolt max/min summaries from the individual bolt time-history rows."
-        note.Location = Point(430, 30)
-        note.Size = Size(330, 40)
+        note.Text = "Derived values include total force/moment and all X/Y/Z axial shear candidates. No single bolt axial direction is assumed."
+        note.Location = Point(456, 28)
+        note.Size = Size(340, 58)
+        attach_tip(self.tooltip, note, "For differently oriented bolts, choose the ShearIf* column that matches that bolt's axial convention during your downstream hand calculation.")
         opt_group.Controls.Add(note)
 
         self.warning = TextBox()
-        self.warning.Location = Point(14, 446)
-        self.warning.Size = Size(775, 68)
+        self.warning.Location = Point(14, 512)
+        self.warning.Size = Size(815, 72)
         self.warning.Multiline = True
         self.warning.ReadOnly = True
         self.warning.BorderStyle = BorderStyle.FixedSingle
-        self.warning.Text = "This script changes Calculate Time History to Yes on the selected bolt UDRs when the property is writable. It does not save the project automatically."
+        self.warning.Text = "This script changes Calculate Time History to Yes on the selected bolt UDRs when the property is writable. It does not save the project automatically. CSV and Excel exports include both wide hand-review tables and tidy postprocessing tables."
+        attach_tip(self.tooltip, self.warning, "Operational note: read-only properties, missing result files, or unavailable result sets are logged in export_log.txt and in the Excel Log sheet.")
         self.Controls.Add(self.warning)
 
         ok = Button()
         ok.Text = "Export"
-        ok.Location = Point(598, 526)
+        ok.Location = Point(638, 600)
         ok.Size = Size(90, 30)
         ok.Click += self.on_export
+        attach_tip(self.tooltip, ok, "Run the export after validating the selected environment, output folder, Excel availability, and missing component warnings.")
         self.Controls.Add(ok)
 
         cancel = Button()
         cancel.Text = "Cancel"
-        cancel.Location = Point(698, 526)
+        cancel.Location = Point(738, 600)
         cancel.Size = Size(90, 30)
         cancel.Click += self.on_cancel
+        attach_tip(self.tooltip, cancel, "Close without exporting or changing result settings.")
         self.Controls.Add(cancel)
 
         self.AcceptButton = ok
@@ -1067,7 +1401,18 @@ class ExportOptionsForm(Form):
     def on_selection_changed(self, sender, args):
         idx = self.combo.SelectedIndex
         if idx >= 0 and idx < len(self.environments):
-            self.detail.Text = self.environments[idx].detail()
+            env = self.environments[idx]
+            self.detail.Text = env.detail()
+            if env.screening_udr_count() == 0:
+                self.screening_check.Checked = False
+                self.screening_check.Enabled = False
+                self.screening_check.Text = "No existing Max/Min Screening UDR values found for this selection"
+                attach_tip(self.tooltip, self.screening_check, "No '{0}' folder with screening UDRs was found under the selected environment. Computed per-bolt summaries will still be exported from individual bolt rows.".format(SCREENING_ROOT))
+            else:
+                self.screening_check.Enabled = True
+                self.screening_check.Checked = True
+                self.screening_check.Text = "Also export existing Max/Min Screening UDR values"
+                attach_tip(self.tooltip, self.screening_check, "Exports the already-created screening UDRs under 'Bolt Results - Max/Min Screening'. The script also computes its own per-bolt max/min summary from the individual bolt data.")
 
     def on_browse(self, sender, args):
         dlg = FolderBrowserDialog()
@@ -1085,7 +1430,34 @@ class ExportOptionsForm(Form):
         if not folder:
             MessageBox.Show("Choose an output folder.", "Bolt Export", MessageBoxButtons.OK, MessageBoxIcon.Warning)
             return
-        self.selected_environment = self.environments[idx]
+        ok, reason = can_write_to_folder(folder)
+        if not ok:
+            MessageBox.Show("The output folder is not writable:\n\n{0}\n\nReason:\n{1}".format(folder, reason), "Bolt Export", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return
+        env = self.environments[idx]
+        missing = env.missing_components()
+        if missing:
+            preview = "\n".join(missing[:10])
+            if len(missing) > 10:
+                preview += "\n... {0} more".format(len(missing) - 10)
+            answer = MessageBox.Show(
+                "Some bolts are missing one or more ENFO/ENMO components.\n\n{0}\n\nExport anyway?".format(preview),
+                "Bolt Export",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+            )
+            if answer != DialogResult.Yes:
+                return
+        if bool(self.xlsx_radio.Checked) and not excel_is_available():
+            MessageBox.Show(
+                "Microsoft Excel COM automation is not available in this session. Select CSV output or install/repair Excel COM support.",
+                "Bolt Export",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning,
+            )
+            self.csv_radio.Checked = True
+            return
+        self.selected_environment = env
         self.output_folder = folder
         self.output_excel = bool(self.xlsx_radio.Checked)
         self.include_time_history = bool(self.history_check.Checked)
@@ -1112,27 +1484,58 @@ def run_export(env, parent_folder, output_excel, include_time_history, include_e
     existing_screening = []
     if include_existing_screening:
         existing_screening = extract_existing_screening(env, log)
+    manifest_rows = build_manifest_rows(
+        env,
+        export_dir,
+        "Excel" if output_excel else "CSV",
+        include_time_history,
+        include_existing_screening,
+        rows_by_bolt,
+        summaries,
+        existing_screening,
+        unit_by_expr,
+        log,
+    )
 
     if output_excel:
         workbook = System.IO.Path.Combine(export_dir, "bolt_results_{0}.xlsx".format(safe_env))
         try:
-            write_excel(workbook, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, log)
+            write_excel(workbook, env, rows_by_bolt, summaries, existing_screening, unit_by_expr, manifest_rows, log)
             log.info("Wrote Excel workbook: " + workbook)
         except Exception as exc:
             log.warn("Excel export failed; writing CSV fallback. Reason: " + safe_text(exc))
             output_excel = False
+            manifest_rows = build_manifest_rows(
+                env,
+                export_dir,
+                "CSV fallback after Excel failure",
+                include_time_history,
+                include_existing_screening,
+                rows_by_bolt,
+                summaries,
+                existing_screening,
+                unit_by_expr,
+                log,
+            )
 
     if not output_excel:
         for bolt in sorted(rows_by_bolt.keys()):
             path = System.IO.Path.Combine(export_dir, "bolt_{0}.csv".format(sanitize_file_name(bolt)))
             write_bolt_csv(path, env, bolt, rows_by_bolt[bolt], summaries.get(bolt, []), unit_by_expr)
             log.info("Wrote " + path)
-        write_summary_csv(System.IO.Path.Combine(export_dir, "computed_screening_summary.csv"), env, rows_by_bolt, summaries)
+        write_wide_all_csv(System.IO.Path.Combine(export_dir, "wide_all_bolts.csv"), rows_by_bolt)
+        write_tidy_csv(System.IO.Path.Combine(export_dir, "tidy_bolt_results.csv"), rows_by_bolt, unit_by_expr)
+        write_units_csv(System.IO.Path.Combine(export_dir, "units_and_definitions.csv"), unit_by_expr)
+        write_summary_csv(System.IO.Path.Combine(export_dir, "computed_screening_summary.csv"), env, summaries, unit_by_expr)
         if include_existing_screening:
             write_existing_screening_csv(System.IO.Path.Combine(export_dir, "existing_screening_udr_values.csv"), existing_screening)
+        write_manifest_csv(System.IO.Path.Combine(export_dir, "manifest.csv"), manifest_rows)
 
     write_log(System.IO.Path.Combine(export_dir, "export_log.txt"), log)
-    return export_dir, len(rows_by_bolt.keys()), log.warnings
+    time_rows = 0
+    for bolt in rows_by_bolt:
+        time_rows += len(rows_by_bolt[bolt])
+    return export_dir, len(rows_by_bolt.keys()), time_rows, log.warnings
 
 
 def main():
@@ -1152,7 +1555,7 @@ def main():
         if form.ShowDialog() != DialogResult.OK:
             return
 
-        export_dir, bolt_count, warnings = run_export(
+        export_dir, bolt_count, time_rows, warnings = run_export(
             form.selected_environment,
             form.output_folder,
             form.output_excel,
@@ -1162,7 +1565,7 @@ def main():
         )
 
         MessageBox.Show(
-            "Export complete.\n\nFolder:\n{0}\n\nBolts exported: {1}\nWarnings: {2}".format(export_dir, bolt_count, warnings),
+            "Export complete.\n\nFolder:\n{0}\n\nBolts exported: {1}\nTime-history rows: {2}\nWarnings: {3}\n\nReview manifest and export_log for details.".format(export_dir, bolt_count, time_rows, warnings),
             "Bolt Export",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information,

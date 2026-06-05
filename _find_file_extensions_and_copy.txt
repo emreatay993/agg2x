@@ -1,0 +1,561 @@
+import sys
+import os
+import shutil
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QFileDialog,
+    QPushButton,
+    QLabel,
+    QLineEdit,
+    QVBoxLayout,
+    QHBoxLayout,
+    QProgressBar,
+    QTextEdit,
+    QMessageBox,
+    QFrame,
+)
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# ADDED: Parses user extension input such as:
+# txt, .csv, *.xlsx, .pdf
+def parse_extensions(extension_text: str) -> list[str]:
+    raw_items = extension_text.replace(";", ",").replace(" ", ",").split(",")
+
+    extensions = []
+
+    for item in raw_items:
+        ext = item.strip().lower()
+
+        if not ext:
+            continue
+
+        if ext.startswith("*."):
+            ext = ext[1:]
+
+        if not ext.startswith("."):
+            ext = "." + ext
+
+        extensions.append(ext)
+
+    return sorted(set(extensions), key=len, reverse=True)
+
+
+# ADDED: Case-insensitive extension matching
+def file_matches_extensions(file_path: Path, extensions: list[str]) -> bool:
+    filename = file_path.name.lower()
+    return any(filename.endswith(ext) for ext in extensions)
+
+
+def get_unique_destination_path(destination_folder: Path, filename: str, reserved_names: set[str]) -> Path:
+    original = Path(filename)
+    stem = original.stem
+    suffix = original.suffix
+
+    candidate = destination_folder / filename
+    counter = 1
+
+    while candidate.exists() or candidate.name.lower() in reserved_names:
+        candidate = destination_folder / f"{stem}_{counter}{suffix}"
+        counter += 1
+
+    reserved_names.add(candidate.name.lower())
+    return candidate
+
+
+class CopyWorker(QObject):
+    file_progress = pyqtSignal(int)
+    total_progress = pyqtSignal(int)
+    status_text = pyqtSignal(str)
+    current_file_text = pyqtSignal(str)
+    counts_updated = pyqtSignal(int, int, int)
+    scan_finished = pyqtSignal(int)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, source_folder: Path, destination_folder: Path, extensions: list[str]):
+        super().__init__()
+        self.source_folder = source_folder
+        self.destination_folder = destination_folder
+        self.extensions = extensions
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
+
+    def run(self):
+        try:
+            self.destination_folder.mkdir(parents=True, exist_ok=True)
+
+            self.status_text.emit("Scanning source folder...")
+            files = self.find_files()
+            self.scan_finished.emit(len(files))
+
+            total_files = len(files)
+            completed_files = 0
+            remaining_files = total_files
+
+            self.counts_updated.emit(total_files, completed_files, remaining_files)
+
+            if total_files == 0:
+                self.status_text.emit("No matching files found.")
+                self.finished.emit()
+                return
+
+            reserved_names = set()
+
+            for source_file in files:
+                if self.cancel_requested:
+                    self.status_text.emit("Copy canceled by user.")
+                    break
+
+                destination_file = get_unique_destination_path(
+                    self.destination_folder,
+                    source_file.name,
+                    reserved_names
+                )
+
+                self.current_file_text.emit(f"{source_file.name} → {destination_file.name}")
+                self.status_text.emit(f"Copying: {source_file}")
+
+                copied = self.copy_file_with_progress(source_file, destination_file)
+
+                if not copied:
+                    break
+
+                completed_files += 1
+                remaining_files = total_files - completed_files
+
+                total_percent = int((completed_files / total_files) * 100)
+
+                self.total_progress.emit(total_percent)
+                self.counts_updated.emit(total_files, completed_files, remaining_files)
+
+                self.status_text.emit(f"Copied: {destination_file.name}")
+
+            self.finished.emit()
+
+        except Exception as e:
+            self.error.emit(str(e))
+            self.finished.emit()
+
+    def find_files(self):
+        found_files = []
+
+        for root, dirs, files in os.walk(self.source_folder):
+            if self.cancel_requested:
+                break
+
+            root_path = Path(root)
+
+            if is_relative_to(root_path, self.destination_folder):
+                continue
+
+            for file_name in files:
+                file_path = root_path / file_name
+
+                if file_path.is_file() and file_matches_extensions(file_path, self.extensions):
+                    found_files.append(file_path)
+
+        return found_files
+
+    def copy_file_with_progress(self, source_file: Path, destination_file: Path) -> bool:
+        chunk_size = 1024 * 1024
+
+        total_size = source_file.stat().st_size
+        copied_size = 0
+
+        self.file_progress.emit(0)
+
+        with open(source_file, "rb") as src, open(destination_file, "wb") as dst:
+            while True:
+                if self.cancel_requested:
+                    dst.close()
+
+                    try:
+                        destination_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+                    return False
+
+                chunk = src.read(chunk_size)
+
+                if not chunk:
+                    break
+
+                dst.write(chunk)
+                copied_size += len(chunk)
+
+                if total_size > 0:
+                    percent = int((copied_size / total_size) * 100)
+                else:
+                    percent = 100
+
+                self.file_progress.emit(percent)
+
+        try:
+            shutil.copystat(source_file, destination_file)
+        except Exception:
+            pass
+
+        self.file_progress.emit(100)
+        return True
+
+
+class FileCopyApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Extension-Based Recursive File Copier")
+        self.resize(850, 560)
+
+        self.source_folder = None
+        self.destination_folder = None
+
+        self.thread = None
+        self.worker = None
+
+        self.init_ui()
+
+    def init_ui(self):
+        central_widget = QWidget()
+        main_layout = QVBoxLayout(central_widget)
+
+        title = QLabel("Extension-Based Recursive File Copier")
+        title.setObjectName("TitleLabel")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        subtitle = QLabel(
+            "Copies files with selected extensions from a source folder and its subfolders into one destination folder."
+        )
+        subtitle.setObjectName("SubtitleLabel")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setWordWrap(True)
+
+        main_layout.addWidget(title)
+        main_layout.addWidget(subtitle)
+
+        main_layout.addWidget(self.separator())
+
+        source_layout = QHBoxLayout()
+        self.source_input = QLineEdit()
+        self.source_input.setPlaceholderText("Select source folder...")
+        self.source_input.setReadOnly(True)
+
+        source_button = QPushButton("Browse Source")
+        source_button.clicked.connect(self.select_source_folder)
+
+        source_layout.addWidget(QLabel("Source:"))
+        source_layout.addWidget(self.source_input)
+        source_layout.addWidget(source_button)
+
+        main_layout.addLayout(source_layout)
+
+        destination_layout = QHBoxLayout()
+        self.destination_input = QLineEdit()
+        self.destination_input.setPlaceholderText("Select destination folder...")
+        self.destination_input.setReadOnly(True)
+
+        destination_button = QPushButton("Browse Destination")
+        destination_button.clicked.connect(self.select_destination_folder)
+
+        destination_layout.addWidget(QLabel("Destination:"))
+        destination_layout.addWidget(self.destination_input)
+        destination_layout.addWidget(destination_button)
+
+        main_layout.addLayout(destination_layout)
+
+        # ADDED: User-specified extension input
+        extension_layout = QHBoxLayout()
+        self.extension_input = QLineEdit()
+        self.extension_input.setPlaceholderText("Example: .txt, .csv, .xlsx, .pdf")
+        self.extension_input.setText(".txt, .csv, .xlsx, .pdf")
+
+        extension_layout.addWidget(QLabel("Extensions:"))
+        extension_layout.addWidget(self.extension_input)
+
+        main_layout.addLayout(extension_layout)
+
+        hint_label = QLabel("Separate extensions with commas, spaces, or semicolons. Examples: txt, .csv, *.xlsx")
+        hint_label.setObjectName("HintLabel")
+        main_layout.addWidget(hint_label)
+
+        main_layout.addWidget(self.separator())
+
+        self.current_file_label = QLabel("Current file: -")
+        self.current_file_label.setWordWrap(True)
+
+        self.file_progress_bar = QProgressBar()
+        self.file_progress_bar.setRange(0, 100)
+        self.file_progress_bar.setValue(0)
+        self.file_progress_bar.setFormat("Current file: %p%")
+
+        self.total_progress_bar = QProgressBar()
+        self.total_progress_bar.setRange(0, 100)
+        self.total_progress_bar.setValue(0)
+        self.total_progress_bar.setFormat("Total progress: %p%")
+
+        main_layout.addWidget(self.current_file_label)
+        main_layout.addWidget(self.file_progress_bar)
+        main_layout.addWidget(self.total_progress_bar)
+
+        counts_layout = QHBoxLayout()
+
+        self.total_files_label = QLabel("Total: 0")
+        self.completed_files_label = QLabel("Completed: 0")
+        self.remaining_files_label = QLabel("Remaining: 0")
+
+        counts_layout.addWidget(self.total_files_label)
+        counts_layout.addWidget(self.completed_files_label)
+        counts_layout.addWidget(self.remaining_files_label)
+        counts_layout.addStretch()
+
+        main_layout.addLayout(counts_layout)
+
+        main_layout.addWidget(self.separator())
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("Copy log will appear here...")
+
+        main_layout.addWidget(self.log_box)
+
+        button_layout = QHBoxLayout()
+
+        self.start_button = QPushButton("Start Copy")
+        self.start_button.clicked.connect(self.start_copy)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel_copy)
+        self.cancel_button.setEnabled(False)
+
+        button_layout.addStretch()
+        button_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.cancel_button)
+
+        main_layout.addLayout(button_layout)
+
+        self.setCentralWidget(central_widget)
+
+    def separator(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+    def select_source_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
+
+        if folder:
+            self.source_folder = Path(folder)
+            self.source_input.setText(str(self.source_folder))
+
+    def select_destination_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Destination Folder")
+
+        if folder:
+            self.destination_folder = Path(folder)
+            self.destination_input.setText(str(self.destination_folder))
+
+    def start_copy(self):
+        if self.source_folder is None:
+            QMessageBox.warning(self, "Missing Source Folder", "Please select a source folder.")
+            return
+
+        if self.destination_folder is None:
+            QMessageBox.warning(self, "Missing Destination Folder", "Please select a destination folder.")
+            return
+
+        if not self.source_folder.exists():
+            QMessageBox.warning(self, "Invalid Source Folder", "The selected source folder does not exist.")
+            return
+
+        if self.source_folder.resolve() == self.destination_folder.resolve():
+            QMessageBox.warning(
+                self,
+                "Invalid Destination Folder",
+                "Source and destination folders cannot be the same."
+            )
+            return
+
+        extensions = parse_extensions(self.extension_input.text())
+
+        if not extensions:
+            QMessageBox.warning(
+                self,
+                "Missing Extensions",
+                "Please enter at least one file extension. Example: .txt, .csv, .pdf"
+            )
+            return
+
+        self.log_box.clear()
+        self.file_progress_bar.setValue(0)
+        self.total_progress_bar.setValue(0)
+        self.current_file_label.setText("Current file: -")
+        self.update_counts(0, 0, 0)
+
+        self.append_log(f"Extensions: {', '.join(extensions)}")
+
+        self.start_button.setEnabled(False)
+        self.cancel_button.setEnabled(True)
+        self.extension_input.setEnabled(False)
+
+        self.thread = QThread()
+        self.worker = CopyWorker(self.source_folder, self.destination_folder, extensions)
+
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+
+        self.worker.file_progress.connect(self.file_progress_bar.setValue)
+        self.worker.total_progress.connect(self.total_progress_bar.setValue)
+        self.worker.status_text.connect(self.append_log)
+        self.worker.current_file_text.connect(self.update_current_file)
+        self.worker.counts_updated.connect(self.update_counts)
+        self.worker.scan_finished.connect(self.on_scan_finished)
+        self.worker.error.connect(self.show_error)
+
+        self.worker.finished.connect(self.copy_finished)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.thread.start()
+
+    def cancel_copy(self):
+        if self.worker is not None:
+            self.worker.cancel()
+            self.append_log("Cancel requested...")
+
+        self.cancel_button.setEnabled(False)
+
+    def copy_finished(self):
+        self.start_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.extension_input.setEnabled(True)
+        self.current_file_label.setText("Current file: -")
+        self.append_log("Finished.")
+
+    def on_scan_finished(self, count):
+        self.append_log(f"Matching files found: {count}")
+
+    def update_current_file(self, text):
+        self.current_file_label.setText(f"Current file: {text}")
+
+    def update_counts(self, total, completed, remaining):
+        self.total_files_label.setText(f"Total: {total}")
+        self.completed_files_label.setText(f"Completed: {completed}")
+        self.remaining_files_label.setText(f"Remaining: {remaining}")
+
+    def append_log(self, text):
+        self.log_box.append(text)
+
+    def show_error(self, message):
+        QMessageBox.critical(self, "Copy Error", message)
+        self.append_log(f"ERROR: {message}")
+
+
+def apply_fusion_style(app):
+    app.setStyle("Fusion")
+
+    app.setStyleSheet("""
+        QWidget {
+            font-size: 10.5pt;
+        }
+
+        QMainWindow {
+            background-color: #f2f2f2;
+        }
+
+        QLabel#TitleLabel {
+            font-size: 20pt;
+            font-weight: bold;
+            padding: 8px;
+        }
+
+        QLabel#SubtitleLabel {
+            color: #555555;
+            padding-bottom: 8px;
+        }
+
+        QLabel#HintLabel {
+            color: #666666;
+            font-size: 9.5pt;
+            padding-left: 4px;
+        }
+
+        QLineEdit {
+            padding: 7px;
+            border: 1px solid #b8b8b8;
+            border-radius: 4px;
+            background-color: white;
+        }
+
+        QPushButton {
+            padding: 8px 14px;
+            border-radius: 5px;
+            background-color: #e5e5e5;
+            border: 1px solid #adadad;
+        }
+
+        QPushButton:hover {
+            background-color: #dcdcdc;
+        }
+
+        QPushButton:pressed {
+            background-color: #cfcfcf;
+        }
+
+        QPushButton:disabled {
+            color: #888888;
+            background-color: #eeeeee;
+        }
+
+        QProgressBar {
+            height: 24px;
+            border: 1px solid #b8b8b8;
+            border-radius: 5px;
+            text-align: center;
+            background-color: white;
+        }
+
+        QProgressBar::chunk {
+            border-radius: 5px;
+            background-color: #5c9ded;
+        }
+
+        QTextEdit {
+            border: 1px solid #b8b8b8;
+            border-radius: 4px;
+            background-color: white;
+            padding: 6px;
+        }
+    """)
+
+
+def main():
+    app = QApplication(sys.argv)
+    apply_fusion_style(app)
+
+    window = FileCopyApp()
+    window.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

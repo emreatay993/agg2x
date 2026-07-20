@@ -1,0 +1,20 @@
+$roots = @($env:APPDATA, $env:LOCALAPPDATA)
+
+$files = Get-ChildItem $roots -Recurse -File -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.FullName -match '(?i)LMS|TestLab|Simcenter' -and
+    $_.Extension -in '.xml', '.config'
+}
+
+foreach ($file in $files) {
+    try {
+        [xml](Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop) |
+            Out-Null
+    }
+    catch {
+        [PSCustomObject]@{
+            File  = $file.FullName
+            Error = $_.Exception.Message
+        }
+    }
+}

@@ -1,0 +1,10 @@
+$roots = @($env:APPDATA, $env:LOCALAPPDATA)
+
+Get-ChildItem $roots -Recurse -File -ErrorAction SilentlyContinue |
+Where-Object {
+    $_.FullName -match '(?i)LMS|TestLab|Simcenter' -and
+    $_.Extension -in '.xml', '.config'
+} |
+Sort-Object LastWriteTime -Descending |
+Select-Object -First 40 FullName, Length, LastWriteTime |
+Format-Table -AutoSize

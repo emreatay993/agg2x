@@ -1,0 +1,9 @@
+.\.venv\Scripts\python.exe -c "import sys; print(sys.executable)"
+
+.\.venv\Scripts\python.exe -m pip show -f ansys-workbench-core
+
+.\.venv\Scripts\python.exe -c "import importlib.util; print(importlib.util.find_spec('ansys.workbench.core'))"
+
+.\.venv\Scripts\python.exe -c "import ansys.workbench.core as awc; print(awc.__file__)"
+
+.\.venv\Scripts\python.exe -m pip check
